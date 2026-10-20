@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>深度估计 + Three.js 重新打光</title>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #0f0f1a; color: #e2e8f0;
+           display: grid; grid-template-columns: 300px 1fr; height: 100vh; overflow: hidden; }
+
+    /* 左侧控制栏 */
+    .sidebar { border-right: 1px solid #1e293b; display: flex; flex-direction: column;
+               gap: 0; overflow-y: auto; }
+    .section { padding: 14px; border-bottom: 1px solid #1e293b; }
+    .section h2 { font-size: 0.7rem; color: #64748b; text-transform: uppercase;
+                  letter-spacing: 0.08em; margin-bottom: 10px; }
+
+    button { width: 100%; padding: 8px; border: none; border-radius: 6px;
+             background: #4f46e5; color: white; cursor: pointer; font-size: 0.82rem;
+             margin-bottom: 6px; transition: background 0.15s; }
+    button:hover:not(:disabled) { background: #4338ca; }
+    button:disabled { background: #1e293b; color: #475569; cursor: not-allowed; }
+
+    input[type=file] { font-size: 0.75rem; color: #94a3b8; width: 100%; margin-bottom: 6px; }
+
+    .preview { width: 100%; border-radius: 6px; border: 1px solid #1e293b;
+               display: none; object-fit: contain; max-height: 130px; background: #1e293b; }
+
+    .progress-bar { background: #1e293b; border-radius: 3px; height: 4px; overflow: hidden; margin: 6px 0; }
+    .progress-fill { background: #4f46e5; height: 100%; width: 0%; transition: width 0.3s; }
+
+    .log { flex: 1; padding: 10px 12px; font-family: monospace; font-size: 0.7rem;
+           color: #64748b; overflow-y: auto; line-height: 1.8; }
+    .log .ok   { color: #6ee7b7; }
+    .log .info { color: #7dd3fc; }
+    .log .warn { color: #fbbf24; }
+
+    /* 右侧 Three.js 画布 */
+    .canvas-wrap { position: relative; background: #000; }
+    #threeCanvas { width: 100%; height: 100%; display: block; cursor: crosshair; }
+
+    .hint { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%);
+            font-size: 0.72rem; color: #334155; pointer-events: none; white-space: nowrap; }
+
+    /* 参数面板 */
+    .param { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+    .param label { font-size: 0.75rem; color: #94a3b8; min-width: 56px; }
+    input[type=range] { flex: 1; accent-color: #4f46e5; }
+    .param span { font-size: 0.72rem; color: #a5b4fc; min-width: 28px; text-align: right; }
+  </style>
+</head>
+<body>
+
+<!-- 左侧控制栏 -->
+<div class="sidebar">
+
+  <div class="section">
+    <h2>① 加载 AI 模型</h2>
+    <button id="btnLoad">加载 Depth Anything V2</button>
+    <div class="progress-bar"><div class="progress-fill" id="pFill"></div></div>
+  </div>
+
+  <div class="section">
+    <h2>② 选择图片</h2>
+    <input type="file" id="fileInput" accept="image/*" disabled>
+    <button id="btnSample" disabled>用示例图片</button>
+    <img id="imgPreview" class="preview">
+  </div>
+
+  <div class="section">
+    <h2>③ 生成深度图 → 打光</h2>
+    <button id="btnRun" disabled>运行深度估计</button>
+  </div>
+
+  <div class="section">
+    <h2>深度图预览</h2>
+    <canvas id="depthPreview" style="width:100%;border-radius:6px;border:1px solid #1e293b;display:block;background:#1e293b;min-height:80px;"></canvas>
+  </div>
+
+  <div class="section">
+    <h2>光照参数（实时）</h2>
+    <div class="param">
+      <label>光强</label>
+      <input type="range" id="sIntensity" min="0.1" max="3" step="0.1" value="1.5">
+      <span id="vIntensity">1.5</span>
+    </div>
+    <div class="param">
+      <label>高光</label>
+      <input type="range" id="sSpecular" min="0" max="1" step="0.05" value="0.4">
+      <span id="vSpecular">0.4</span>
+    </div>
+    <div class="param">
+      <label>光高度</label>
+      <input type="range" id="sHeight" min="0.1" max="3" step="0.05" value="1.5">
+      <span id="vHeight">1.5</span>
+    </div>
+    <div class="param">
+      <label>深度强</label>
+      <input type="range" id="sDepthScale" min="0.01" max="0.3" step="0.01" value="0.08">
+      <span id="vDepthScale">0.08</span>
+    </div>
+    <div class="param">
+      <label>环境光</label>
+      <input type="range" id="sAmbient" min="0" max="1" step="0.05" value="0.2">
+      <span id="vAmbient">0.2</span>
+    </div>
+  </div>
+
+  <div class="log" id="log"><div class="info">等待加载模型...</div></div>
+</div>
+
+<!-- 右侧 Three.js 画布 -->
+<div class="canvas-wrap">
+  <canvas id="threeCanvas"></canvas>
+  <div class="hint">鼠标移动 = 移动光源位置</div>
+</div>
+
+<!-- Transformers.js (ES Module) -->
+<script type="module">
+import { pipeline, env }
+  from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.3/dist/transformers.min.js';
+
+env.allowLocalModels = false;
+
+// ── 状态 ────────────────────────────────────────────
+let depthPipeline = null;
+let currentImageSrc = null;
+
+// ── Three.js 场景 ────────────────────────────────────
+const canvas   = document.getElementById('threeCanvas');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+
+const scene  = new THREE.Scene();
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+// 光源位置（UV 空间，0-1）
+// lightPos.z 必须 > 场景最大深度值（~1.0），否则远处像素的光源会跑到它们"后面"
+const lightPos = new THREE.Vector3(0.5, 0.5, 1.5);
+
+// 占位平面，贴图加载后替换
+const geo = new THREE.PlaneGeometry(2, 2);
+
+// ── 核心：自定义 Shader ──────────────────────────────
+// 原理：
+//   1. 从深度图采样相邻像素的深度，用有限差分算法计算法线
+//      normal = normalize( vec3(dL-dR, dU-dD, depthScale) )
+//   2. 计算法线与光源方向的点积 → 漫反射
+//   3. 加 Blinn-Phong 高光
+//   4. 简单光线步进（ray march）算软阴影
+const vertShader = /*glsl*/`
+  varying vec2 vUv;
+  void main() {
+    vUv = uv;
+    gl_Position = vec4(position, 1.0);
+  }
+`;
+
+const fragShader = /*glsl*/`
+  precision highp float;
+  varying vec2 vUv;
+
+  uniform sampler2D uImage;      // 原始图像
+  uniform sampler2D uDepth;      // 深度图（灰度，0=近，1=远）
+  uniform vec3      uLightPos;   // 光源位置（UV空间 xy + 高度 z）
+  uniform float     uIntensity;  // 光强
+  uniform float     uSpecular;   // 高光强度
+  uniform float     uDepthScale; // 深度影响法线的强度
+  uniform float     uAmbient;    // 环境光
+  uniform vec2      uResolution; // 画布尺寸
+
+  // 从深度图采样深度值
+  float getDepth(vec2 uv) {
+    return texture2D(uDepth, uv).r;
+  }
+
+  void main() {
+    // px = 单个像素在UV坐标系里的大小（UV是0~1，所以1/分辨率=一个像素）
+    vec2 px = 1.0 / uResolution;
+
+    // ════════════════════════════════════════════════════
+    // 第一步：采样当前像素的上下左右四个邻居的深度值
+    //
+    //   深度图是一张灰度图，每个位置存了一个数字 d(x,y)
+    //   这个数字代表"这个像素的物体离相机多远"
+    //
+    //   dL = 左边那个像素的深度
+    //   dR = 右边那个像素的深度
+    //   dU = 上边那个像素的深度
+    //   dD = 下边那个像素的深度
+    // ════════════════════════════════════════════════════
+    float dL = getDepth(vUv + vec2(-px.x, 0.0));
+    float dR = getDepth(vUv + vec2(+px.x, 0.0));
+    float dU = getDepth(vUv + vec2(0.0, +px.y));
+    float dD = getDepth(vUv + vec2(0.0, -px.y));
+
+    // ════════════════════════════════════════════════════
+    // 第二步：用"有限差分"近似偏导数（即斜率）
+    //
+    // 【高中导数回顾】
+    //   导数 = 斜率 = 函数变化了多少 / 自变量变化了多少
+    //   精确写法：f'(x) = lim(h→0) (f(x+h) - f(x)) / h
+    //   离散近似：f'(x) ≈ (f(x+h) - f(x-h)) / (2h)  ← 取两侧更准
+    //
+    // 【偏导数是什么】
+    //   深度 d 同时受 x 和 y 影响，是二元函数 d(x, y)
+    //   偏导数 = 只让一个变量动，另一个变量固定不动时的斜率
+    //
+    //   ∂d/∂x = 只让 X 动，Y 固定 → 体现在采样时 Y偏移量=0：
+    //     dL = getDepth(vUv + vec2(-px.x,  0.0 ))  ← X左移，Y=0不动
+    //     dR = getDepth(vUv + vec2(+px.x,  0.0 ))  ← X右移，Y=0不动
+    //     ∂d/∂x ≈ (dR - dL) / (2·px.x)
+    //     意思：往右走一像素，深度变化多少
+    //
+    //   ∂d/∂y = 只让 Y 动，X 固定 → 体现在采样时 X偏移量=0：
+    //     dU = getDepth(vUv + vec2( 0.0, +px.y))  ← Y上移，X=0不动
+    //     dD = getDepth(vUv + vec2( 0.0, -px.y))  ← Y下移，X=0不动
+    //     ∂d/∂y ≈ (dU - dD) / (2·px.y)
+    //     意思：往上走一像素，深度变化多少
+    //
+    //   "固定另一个变量"在代码里就是：偏移向量里那个方向写 0.0
+    // ════════════════════════════════════════════════════
+    float dzdx = (dR - dL) / (2.0 * px.x); // X方向偏导：Y固定，X左右采样
+    float dzdy = (dU - dD) / (2.0 * px.y); // Y方向偏导：X固定，Y上下采样
+
+    // ════════════════════════════════════════════════════
+    // 第三步：构造曲面的两个切线向量
+    //
+    // 深度图定义了一个三维曲面，每个点是 P(x, y, d(x,y))
+    //
+    // 沿X方向移动一小步：
+    //   从 (x, y, d) 到 (x+1, y, d+dzdx)
+    //   切线Tx = 终点 - 起点 = (1, 0, dzdx)
+    //
+    // 沿Y方向移动一小步：
+    //   从 (x, y, d) 到 (x, y+1, d+dzdy)
+    //   切线Ty = 终点 - 起点 = (0, 1, dzdy)
+    // ════════════════════════════════════════════════════
+    vec3 Tx = vec3(1.0, 0.0, dzdx);
+    vec3 Ty = vec3(0.0, 1.0, dzdy);
+
+    // ════════════════════════════════════════════════════
+    // 第四步：法线 = 两个切线的叉积
+    //
+    // 高中向量：两个向量确定一个平面，叉积方向垂直于这个平面
+    //
+    // 叉积公式 Tx × Ty：
+    //   N.x = Tx.y * Ty.z - Tx.z * Ty.y = 0*dzdy - dzdx*1 = -dzdx
+    //   N.y = Tx.z * Ty.x - Tx.x * Ty.z = dzdx*0 - 1*dzdy  = -dzdy
+    //   N.z = Tx.x * Ty.y - Tx.y * Ty.x = 1*1    - 0*0      = 1
+    //
+    // 所以法线 = (-dzdx, -dzdy, 1)
+    // Z分量永远是1，不是拍脑袋，是叉积公式算出来的！
+    //
+    // uDepthScale：控制斜率对法线的影响强度
+    //   小 → 法线接近(0,0,1)垂直向上 → 光照平缓
+    //   大 → 法线倾斜明显 → 凹凸感强
+    // ════════════════════════════════════════════════════
+    vec3 N = vec3(-dzdx * uDepthScale, -dzdy * uDepthScale, 1.0);
+    // 等价于手写叉积：cross(Tx * uDepthScale, Ty * uDepthScale)
+
+    vec3 normal = normalize(N); // 归一化为单位向量，长度=1，只保留方向
+
+    // ② 计算光源方向
+    float depth  = getDepth(vUv);
+    vec3  pos    = vec3(vUv, depth);              // 当前像素3D位置
+    vec3  toLight = normalize(uLightPos - pos);   // 指向光源的单位向量
+
+    // ③ 漫反射（Wrapped Lambert，比标准 Lambert 更柔和）
+    float wrap    = 0.3;
+    float diffuse = clamp((dot(normal, toLight) + wrap) / (1.0 + wrap), 0.0, 1.0);
+
+    // ④ Blinn-Phong 高光
+    vec3  viewDir = vec3(0.0, 0.0, 1.0);         // 正交相机，视线方向固定朝 Z
+    vec3  halfVec = normalize(toLight + viewDir);
+    float spec    = pow(max(dot(normal, halfVec), 0.0), 32.0) * uSpecular;
+
+    // ⑤ 简单软阴影（ray march：从当前像素沿光源方向步进，检查是否被遮挡）
+    float shadow  = 1.0;
+    vec2  lightXY = uLightPos.xy;
+    vec2  dir2D   = lightXY - vUv;
+    float dist    = length(dir2D);
+    vec2  step    = normalize(dir2D) * px * 2.0;
+    vec2  cur     = vUv + step;
+    float curDepth = depth;
+
+    for (int i = 0; i < 16; i++) {
+      if (length(cur - vUv) >= dist) break;
+      float sDepth = getDepth(cur);
+      // 如果步进路径上某点深度比起点浅（更近相机），说明被遮挡
+      if (sDepth < curDepth - 0.02) {
+        shadow -= 0.04;
+      }
+      cur += step;
+    }
+    shadow = clamp(shadow, 0.5, 1.0);
+
+    // ⑥ 合成
+    vec4  color   = texture2D(uImage, vUv);
+    float light   = uAmbient + (diffuse + spec) * uIntensity * shadow;
+    gl_FragColor  = vec4(color.rgb * light, color.a);
+  }
+`;
+
+const uniforms = {
+  uImage:      { value: null },
+  uDepth:      { value: null },
+  uLightPos:   { value: lightPos },
+  uIntensity:  { value: 1.5 },
+  uSpecular:   { value: 0.4 },
+  uDepthScale: { value: 0.08 },
+  uAmbient:    { value: 0.2 },
+  uResolution: { value: new THREE.Vector2(512, 512) },
+};
+
+const mat  = new THREE.ShaderMaterial({ vertexShader: vertShader, fragmentShader: fragShader, uniforms });
+const mesh = new THREE.Mesh(geo, mat);
+scene.add(mesh);
+
+// ── 渲染循环 ─────────────────────────────────────────
+function resize() {
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== w || canvas.height !== h) {
+    renderer.setSize(w, h, false);
+    uniforms.uResolution.value.set(w, h);
+  }
+}
+(function animate() {
+  requestAnimationFrame(animate);
+  resize();
+  renderer.render(scene, camera);
+})();
+
+// ── 鼠标控制光源 ─────────────────────────────────────
+canvas.addEventListener('mousemove', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  // UV 坐标：左下原点
+  const u = (e.clientX - rect.left) / rect.width;
+  const v = 1.0 - (e.clientY - rect.top) / rect.height;
+  lightPos.x = u;
+  lightPos.y = v;
+  // z 由滑块控制
+});
+
+// ── 参数滑块 ─────────────────────────────────────────
+function bindSlider(id, valId, uniform) {
+  const s = document.getElementById(id);
+  const v = document.getElementById(valId);
+  s.oninput = () => {
+    const val = parseFloat(s.value);
+    v.textContent = val;
+    uniforms[uniform].value = val;
+  };
+}
+bindSlider('sIntensity',  'vIntensity',  'uIntensity');
+bindSlider('sSpecular',   'vSpecular',   'uSpecular');
+bindSlider('sDepthScale', 'vDepthScale', 'uDepthScale');
+bindSlider('sAmbient',    'vAmbient',    'uAmbient');
+
+document.getElementById('sHeight').oninput = (e) => {
+  const val = parseFloat(e.target.value);
+  document.getElementById('vHeight').textContent = val;
+  lightPos.z = val;
+};
+
+// ── 日志 ─────────────────────────────────────────────
+function log(msg, type = 'info') {
+  const el = document.getElementById('log');
+  const d  = document.createElement('div');
+  d.className = type; d.textContent = msg;
+  el.prepend(d);
+}
+
+// ── ① 加载模型 ───────────────────────────────────────
+document.getElementById('btnLoad').onclick = async () => {
+  document.getElementById('btnLoad').disabled = true;
+  log('下载模型中（~50MB 首次）...', 'info');
+  try {
+    depthPipeline = await pipeline(
+      'depth-estimation',
+      'onnx-community/depth-anything-v2-small',
+      { progress_callback: (p) => {
+          if (p.status === 'downloading' && p.total) {
+            document.getElementById('pFill').style.width =
+              Math.round(p.loaded / p.total * 90) + '%';
+          }
+        }
+      }
+    );
+    document.getElementById('pFill').style.width = '100%';
+    log('✓ 模型就绪', 'ok');
+    document.getElementById('fileInput').disabled = false;
+    document.getElementById('btnSample').disabled = false;
+    document.getElementById('btnRun').disabled    = false;
+  } catch(e) {
+    log('✗ ' + e.message, 'warn');
+    document.getElementById('btnLoad').disabled = false;
+  }
+};
+
+// ── ② 图片选择 ───────────────────────────────────────
+function setImage(src, crossOrigin = false) {
+  currentImageSrc = src;
+  const img = document.getElementById('imgPreview');
+  img.src = src;
+  if (crossOrigin) img.crossOrigin = 'anonymous';
+  img.style.display = 'block';
+}
+
+document.getElementById('fileInput').onchange = (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  setImage(URL.createObjectURL(file));
+  log('图片已选：' + file.name, 'info');
+};
+
+document.getElementById('btnSample').onclick = () => {
+  setImage(
+    'https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/cats.jpg',
+    true
+  );
+  log('示例图片已选', 'info');
+};
+
+// ── ③ 运行深度估计 → 生成 Three.js 纹理 ─────────────
+document.getElementById('btnRun').onclick = async () => {
+  if (!depthPipeline || !currentImageSrc) {
+    log('请先加载模型并选择图片', 'warn'); return;
+  }
+  document.getElementById('btnRun').disabled = true;
+  log('▶ 推理中...', 'info');
+
+  try {
+    const t0 = performance.now();
+    const output = await depthPipeline(currentImageSrc);
+    log(`✓ 深度估计完成，耗时 ${(performance.now()-t0).toFixed(0)}ms`, 'ok');
+
+    // ── 把原图加载为 Three.js 纹理 ────────────────────
+    const imgTex = new THREE.TextureLoader().load(currentImageSrc);
+    imgTex.flipY = true;
+    uniforms.uImage.value = imgTex;
+
+    // ── 把深度图（灰度 RawImage）画到 canvas，转为纹理 ─
+    // output.depth 是 RawImage { data: Uint8Array, width, height, channels:1 }
+    const { depth } = output;
+    const depthCanvas = document.createElement('canvas');
+    depthCanvas.width  = depth.width;
+    depthCanvas.height = depth.height;
+    const ctx   = depthCanvas.getContext('2d');
+    const imgData = ctx.createImageData(depth.width, depth.height);
+
+    for (let i = 0; i < depth.width * depth.height; i++) {
+      const v = depth.data[i];
+      imgData.data[i*4+0] = v;
+      imgData.data[i*4+1] = v;
+      imgData.data[i*4+2] = v;
+      imgData.data[i*4+3] = 255;
+    }
+    ctx.putImageData(imgData, 0, 0);
+
+    // 同步显示到侧栏预览
+    const preview = document.getElementById('depthPreview');
+    preview.width  = depth.width;
+    preview.height = depth.height;
+    preview.getContext('2d').putImageData(imgData, 0, 0);
+
+    // CanvasTexture：直接从 canvas 创建纹理，不需要服务器
+    const depthTex = new THREE.CanvasTexture(depthCanvas);
+    depthTex.flipY  = true;
+    uniforms.uDepth.value = depthTex;
+
+    log(`✓ 深度图已传入 shader（${depth.width}×${depth.height}）`, 'ok');
+    log('移动鼠标查看动态打光效果', 'info');
+
+  } catch(e) {
+    log('✗ ' + e.message, 'warn');
+    console.error(e);
+  }
+  document.getElementById('btnRun').disabled = false;
+};
+</script>
+
+</body>
+</html>
