@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>深度估计 + Three.js 重新打光</title>
-  <script src="https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.min.js"></script>
+  <script src="./libs/three.min.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: system-ui, sans-serif; background: #0f0f1a; color: #e2e8f0;
@@ -57,20 +57,23 @@
 <div class="sidebar">
 
   <div class="section">
-    <h2>① 加载 AI 模型</h2>
-    <button id="btnLoad">加载 Depth Anything V2</button>
-    <div class="progress-bar"><div class="progress-fill" id="pFill"></div></div>
-  </div>
-
-  <div class="section">
-    <h2>② 选择图片</h2>
-    <input type="file" id="fileInput" accept="image/*" disabled>
-    <button id="btnSample" disabled>用示例图片</button>
+    <h2>① 选择图片</h2>
+    <input type="file" id="fileInput" accept="image/*">
+    <button id="btnSample">用示例图片</button>
     <img id="imgPreview" class="preview">
   </div>
 
   <div class="section">
-    <h2>③ 生成深度图 → 打光</h2>
+    <h2>② 上传深度图（有了就跳过AI）</h2>
+    <input type="file" id="depthInput" accept="image/*">
+    <img id="depthImgPreview" class="preview">
+    <div style="font-size:0.7rem;color:#64748b;margin-top:4px;">灰度图，白=近，黑=远。上传后立即打光。</div>
+  </div>
+
+  <div class="section">
+    <h2>③ 或用 AI 生成深度图</h2>
+    <button id="btnLoad">加载 Depth Anything V2</button>
+    <div class="progress-bar"><div class="progress-fill" id="pFill"></div></div>
     <button id="btnRun" disabled>运行深度估计</button>
   </div>
 
@@ -120,9 +123,11 @@
 <!-- Transformers.js (ES Module) -->
 <script type="module">
 import { pipeline, env }
-  from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.3/dist/transformers.min.js';
+  from './libs/transformers.min.js';
 
-env.allowLocalModels = false;
+env.allowLocalModels = true;
+env.allowRemoteModels = false;
+env.localModelPath = './models/';
 
 // ── 状态 ────────────────────────────────────────────
 let depthPipeline = null;
@@ -391,9 +396,7 @@ document.getElementById('btnLoad').onclick = async () => {
     );
     document.getElementById('pFill').style.width = '100%';
     log('✓ 模型就绪', 'ok');
-    document.getElementById('fileInput').disabled = false;
-    document.getElementById('btnSample').disabled = false;
-    document.getElementById('btnRun').disabled    = false;
+    document.getElementById('btnRun').disabled = false;
   } catch(e) {
     log('✗ ' + e.message, 'warn');
     document.getElementById('btnLoad').disabled = false;
@@ -422,6 +425,48 @@ document.getElementById('btnSample').onclick = () => {
     true
   );
   log('示例图片已选', 'info');
+};
+
+// ── 手动上传深度图 ────────────────────────────────────
+document.getElementById('depthInput').onchange = (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  if (!currentImageSrc) { log('请先选择原图', 'warn'); return; }
+
+  const url = URL.createObjectURL(file);
+
+  // 显示深度图预览缩略图
+  const depthImgPreview = document.getElementById('depthImgPreview');
+  depthImgPreview.src = url;
+  depthImgPreview.style.display = 'block';
+
+  const img = new Image();
+  img.onload = () => {
+    // 画到 canvas 以便转 CanvasTexture
+    const c = document.createElement('canvas');
+    c.width = img.width; c.height = img.height;
+    c.getContext('2d').drawImage(img, 0, 0);
+
+    // 同步到侧栏深度图预览
+    const preview = document.getElementById('depthPreview');
+    preview.width = img.width; preview.height = img.height;
+    preview.getContext('2d').drawImage(img, 0, 0);
+
+    const depthTex = new THREE.CanvasTexture(c);
+    depthTex.flipY = true;
+    uniforms.uDepth.value = depthTex;
+
+    // 同时把原图传给 shader
+    const imgTex = new THREE.TextureLoader().load(currentImageSrc);
+    imgTex.flipY = true;
+    uniforms.uImage.value = imgTex;
+
+    log(`✓ 深度图已应用（${img.width}×${img.height}），无需AI`, 'ok');
+    log('移动鼠标查看动态打光效果', 'info');
+    URL.revokeObjectURL(url);
+  };
+  img.src = url;
+  log('深度图读取中...', 'info');
 };
 
 // ── ③ 运行深度估计 → 生成 Three.js 纹理 ─────────────
