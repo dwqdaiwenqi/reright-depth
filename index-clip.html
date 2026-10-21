@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CLIP 零样本分类 - Transformers.js</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #0f0f1a; color: #e2e8f0;
+           display: grid; grid-template-columns: 300px 1fr; height: 100vh; overflow: hidden; }
+
+    .sidebar { border-right: 1px solid #1e293b; display: flex; flex-direction: column; overflow-y: auto; }
+    .section { padding: 14px; border-bottom: 1px solid #1e293b; }
+    .section h2 { font-size: 0.7rem; color: #64748b; text-transform: uppercase;
+                  letter-spacing: 0.08em; margin-bottom: 10px; }
+
+    button { width: 100%; padding: 8px; border: none; border-radius: 6px;
+             background: #4f46e5; color: white; cursor: pointer; font-size: 0.82rem;
+             margin-bottom: 6px; transition: background 0.15s; }
+    button:hover:not(:disabled) { background: #4338ca; }
+    button:disabled { background: #1e293b; color: #475569; cursor: not-allowed; }
+    input[type=file] { font-size: 0.75rem; color: #94a3b8; width: 100%; margin-bottom: 6px; }
+
+    textarea { width: 100%; background: #1e293b; border: 1px solid #334155; border-radius: 6px;
+               color: #e2e8f0; padding: 8px; font-size: 0.78rem; resize: vertical;
+               min-height: 80px; font-family: system-ui; line-height: 1.5; }
+    textarea:focus { outline: none; border-color: #4f46e5; }
+
+    .progress-bar { background: #1e293b; border-radius: 3px; height: 4px; overflow: hidden; margin: 6px 0; }
+    .progress-fill { background: #4f46e5; height: 100%; width: 0%; transition: width 0.3s; }
+
+    .log { flex: 1; padding: 10px 12px; font-family: monospace; font-size: 0.7rem;
+           color: #64748b; overflow-y: auto; line-height: 1.8; }
+    .log .ok   { color: #6ee7b7; }
+    .log .info { color: #7dd3fc; }
+    .log .warn { color: #fbbf24; }
+
+    /* 右侧 */
+    .canvas-wrap { background: #000; display: flex; flex-direction: column;
+                   align-items: center; justify-content: center; gap: 32px; padding: 32px; overflow-y: auto; }
+
+    #outputImg { max-width: 400px; max-height: 50vh; border-radius: 10px;
+                 border: 1px solid #1e293b; object-fit: contain; display: none; }
+
+    .results-panel { width: 100%; max-width: 560px; }
+    .results-title { font-size: 0.7rem; color: #64748b; text-transform: uppercase;
+                     letter-spacing: 0.08em; margin-bottom: 12px; }
+
+    .bar-row { margin-bottom: 12px; }
+    .bar-meta { display: flex; justify-content: space-between; margin-bottom: 4px; }
+    .bar-label { font-size: 0.82rem; color: #e2e8f0; }
+    .bar-score { font-size: 0.78rem; color: #a5b4fc; font-family: monospace; }
+    .bar-bg { background: #1e293b; border-radius: 4px; height: 8px; overflow: hidden; }
+    .bar-fill { height: 100%; border-radius: 4px; transition: width 0.5s ease; }
+
+    .winner-badge { display: inline-block; background: #4f46e5; color: #fff;
+                    font-size: 0.65rem; padding: 1px 6px; border-radius: 10px;
+                    margin-left: 6px; vertical-align: middle; }
+
+    .hint-text { font-size: 0.72rem; color: #334155; text-align: center; }
+  </style>
+</head>
+<body>
+
+<div class="sidebar">
+  <div class="section">
+    <h2>① 选择图片</h2>
+    <input type="file" id="fileInput" accept="image/*">
+    <button id="btnSample1">示例：猫咪</button>
+    <button id="btnSample2">示例：街景</button>
+  </div>
+
+  <div class="section">
+    <h2>② 输入候选标签（英文）</h2>
+    <div style="font-size:0.7rem;color:#64748b;margin-bottom:6px;">
+      每行一个，或逗号分隔，用你自己的描述
+    </div>
+    <textarea id="labelsInput">a photo of a cat
+a photo of a dog
+a photo of a person
+a photo of a city street
+a photo of nature
+a photo of food</textarea>
+  </div>
+
+  <div class="section">
+    <h2>③ 加载模型</h2>
+    <div style="font-size:0.7rem;color:#64748b;margin-bottom:6px;">
+      CLIP ViT-B/32，首次约 150MB
+    </div>
+    <button id="btnLoad">加载 CLIP 模型</button>
+    <div class="progress-bar"><div class="progress-fill" id="pFill"></div></div>
+    <button id="btnRun" disabled>运行零样本分类</button>
+  </div>
+
+  <div class="log" id="log"><div class="info">等待加载模型...</div></div>
+</div>
+
+<div class="canvas-wrap">
+  <img id="outputImg" alt="预览">
+  <div class="results-panel">
+    <div class="results-title">分类结果（相似度得分）</div>
+    <div id="barChart">
+      <div class="hint-text">加载模型并运行后，结果显示在这里</div>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import { pipeline, env } from './libs/transformers.min.js';
+
+env.allowLocalModels  = true;
+env.allowRemoteModels = true;
+env.localModelPath    = './models/';
+
+let classifier = null;
+let currentSrc = null;
+
+const BAR_COLORS = [
+  '#6366f1','#22c55e','#f97316','#06b6d4',
+  '#ec4899','#eab308','#ef4444','#14b8a6',
+];
+
+function log(msg, type = 'info') {
+  const el = document.getElementById('log');
+  const d  = document.createElement('div');
+  d.className = type; d.textContent = msg;
+  el.prepend(d);
+}
+
+function setImage(src, crossOrigin = false) {
+  currentSrc = src;
+  const img  = document.getElementById('outputImg');
+  img.src    = src;
+  if (crossOrigin) img.crossOrigin = 'anonymous';
+  img.style.display = 'block';
+}
+
+document.getElementById('fileInput').onchange = (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  setImage(URL.createObjectURL(file));
+  log('图片已选：' + file.name);
+};
+document.getElementById('btnSample1').onclick = () => {
+  setImage('https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/cats.jpg', true);
+  log('示例图片：猫咪');
+};
+document.getElementById('btnSample2').onclick = () => {
+  setImage('https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/city.jpg', true);
+  log('示例图片：街景');
+};
+
+document.getElementById('btnLoad').onclick = async () => {
+  document.getElementById('btnLoad').disabled = true;
+  log('下载模型中（~150MB 首次）...', 'info');
+  try {
+    classifier = await pipeline(
+      'zero-shot-image-classification',
+      'Xenova/clip-vit-base-patch32',
+      { progress_callback: (p) => {
+          if (p.status === 'downloading' && p.total)
+            document.getElementById('pFill').style.width =
+              Math.round(p.loaded / p.total * 90) + '%';
+        }
+      }
+    );
+    document.getElementById('pFill').style.width = '100%';
+    log('✓ 模型就绪（CLIP）', 'ok');
+    document.getElementById('btnRun').disabled = false;
+  } catch(e) {
+    log('✗ ' + e.message, 'warn');
+    document.getElementById('btnLoad').disabled = false;
+  }
+};
+
+document.getElementById('btnRun').onclick = async () => {
+  if (!classifier || !currentSrc) { log('请先加载模型并选择图片', 'warn'); return; }
+
+  // 解析标签
+  const raw    = document.getElementById('labelsInput').value;
+  const labels = raw.split(/[\n,]/).map(s => s.trim()).filter(Boolean);
+  if (labels.length < 2) { log('请至少输入 2 个候选标签', 'warn'); return; }
+
+  document.getElementById('btnRun').disabled = true;
+  log(`▶ 对 ${labels.length} 个标签分类中...`, 'info');
+
+  try {
+    const t0 = performance.now();
+    // CLIP：同时计算图片和所有候选文本的相似度，输出 softmax 得分
+    const results = await classifier(currentSrc, labels);
+    const ms = (performance.now() - t0).toFixed(0);
+    log(`✓ 完成，耗时 ${ms}ms`, 'ok');
+
+    // 按得分降序排列
+    results.sort((a, b) => b.score - a.score);
+    const maxScore = results[0].score;
+
+    // 渲染条形图
+    const chart = document.getElementById('barChart');
+    chart.innerHTML = '';
+    results.forEach(({ label, score }, i) => {
+      const pct   = (score / maxScore * 100).toFixed(1);
+      const color = BAR_COLORS[i % BAR_COLORS.length];
+      const isWinner = i === 0;
+
+      const row = document.createElement('div');
+      row.className = 'bar-row';
+      row.innerHTML = `
+        <div class="bar-meta">
+          <span class="bar-label">${label}${isWinner ? '<span class="winner-badge">最高</span>' : ''}</span>
+          <span class="bar-score">${(score * 100).toFixed(2)}%</span>
+        </div>
+        <div class="bar-bg">
+          <div class="bar-fill" style="width:0%;background:${color}" data-target="${pct}%"></div>
+        </div>
+      `;
+      chart.appendChild(row);
+    });
+
+    // 动画：延一帧后设宽度让 transition 生效
+    requestAnimationFrame(() => {
+      chart.querySelectorAll('.bar-fill').forEach(el => {
+        el.style.width = el.dataset.target;
+      });
+    });
+
+  } catch(e) {
+    log('✗ ' + e.message, 'warn');
+    console.error(e);
+  }
+  document.getElementById('btnRun').disabled = false;
+};
+</script>
+</body>
+</html>

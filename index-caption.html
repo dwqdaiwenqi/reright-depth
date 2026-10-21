@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>图片描述生成 - Transformers.js</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #0f0f1a; color: #e2e8f0;
+           display: grid; grid-template-columns: 300px 1fr; height: 100vh; overflow: hidden; }
+
+    .sidebar { border-right: 1px solid #1e293b; display: flex; flex-direction: column; overflow-y: auto; }
+    .section { padding: 14px; border-bottom: 1px solid #1e293b; }
+    .section h2 { font-size: 0.7rem; color: #64748b; text-transform: uppercase;
+                  letter-spacing: 0.08em; margin-bottom: 10px; }
+
+    button { width: 100%; padding: 8px; border: none; border-radius: 6px;
+             background: #4f46e5; color: white; cursor: pointer; font-size: 0.82rem;
+             margin-bottom: 6px; transition: background 0.15s; }
+    button:hover:not(:disabled) { background: #4338ca; }
+    button:disabled { background: #1e293b; color: #475569; cursor: not-allowed; }
+    input[type=file] { font-size: 0.75rem; color: #94a3b8; width: 100%; margin-bottom: 6px; }
+
+    .progress-bar { background: #1e293b; border-radius: 3px; height: 4px; overflow: hidden; margin: 6px 0; }
+    .progress-fill { background: #4f46e5; height: 100%; width: 0%; transition: width 0.3s; }
+
+    .log { flex: 1; padding: 10px 12px; font-family: monospace; font-size: 0.7rem;
+           color: #64748b; overflow-y: auto; line-height: 1.8; }
+    .log .ok   { color: #6ee7b7; }
+    .log .info { color: #7dd3fc; }
+    .log .warn { color: #fbbf24; }
+
+    .canvas-wrap { position: relative; background: #000; display: flex; flex-direction: column;
+                   align-items: center; justify-content: center; gap: 24px; padding: 24px; }
+
+    #outputImg { max-width: 100%; max-height: 60vh; border-radius: 8px;
+                 border: 1px solid #1e293b; object-fit: contain; display: none; }
+
+    .caption-box { width: 100%; max-width: 640px; }
+    .caption-label { font-size: 0.7rem; color: #64748b; text-transform: uppercase;
+                     letter-spacing: 0.08em; margin-bottom: 8px; }
+    .caption-text { background: #1e293b; border-radius: 8px; padding: 16px;
+                    font-size: 1.1rem; color: #e2e8f0; line-height: 1.6; min-height: 60px;
+                    border: 1px solid #334155; font-style: italic; }
+    .caption-text.empty { color: #475569; font-style: normal; font-size: 0.85rem; }
+
+    .history { width: 100%; max-width: 640px; }
+    .history-item { padding: 8px 12px; margin-bottom: 6px; background: #0f172a;
+                    border-radius: 6px; font-size: 0.8rem; color: #94a3b8; border: 1px solid #1e293b; }
+    .history-item .hi-time { font-size: 0.65rem; color: #475569; margin-bottom: 2px; }
+  </style>
+</head>
+<body>
+
+<div class="sidebar">
+  <div class="section">
+    <h2>① 选择图片</h2>
+    <input type="file" id="fileInput" accept="image/*">
+    <button id="btnSample1">示例：猫咪</button>
+    <button id="btnSample2">示例：街景</button>
+  </div>
+
+  <div class="section">
+    <h2>② 加载模型</h2>
+    <div style="font-size:0.7rem;color:#64748b;margin-bottom:6px;">
+      ViT-GPT2 图片描述模型，首次约 250MB
+    </div>
+    <button id="btnLoad">加载图片描述模型</button>
+    <div class="progress-bar"><div class="progress-fill" id="pFill"></div></div>
+    <button id="btnRun" disabled>生成图片描述</button>
+    <button id="btnRunAgain" disabled>再生成一次（随机性）</button>
+  </div>
+
+  <div class="log" id="log"><div class="info">等待加载模型...</div></div>
+</div>
+
+<div class="canvas-wrap">
+  <img id="outputImg" alt="预览">
+
+  <div class="caption-box">
+    <div class="caption-label">生成的描述</div>
+    <div class="caption-text empty" id="captionText">运行模型后，AI 生成的英文描述将显示在这里</div>
+  </div>
+
+  <div class="history" id="history"></div>
+</div>
+
+<script type="module">
+import { pipeline, env } from './libs/transformers.min.js';
+
+env.allowLocalModels  = true;
+env.allowRemoteModels = true;
+env.localModelPath    = './models/';
+
+let captioner    = null;
+let currentSrc   = null;
+let runCount     = 0;
+
+function log(msg, type = 'info') {
+  const el = document.getElementById('log');
+  const d  = document.createElement('div');
+  d.className = type; d.textContent = msg;
+  el.prepend(d);
+}
+
+function setImage(src, crossOrigin = false) {
+  currentSrc = src;
+  const img  = document.getElementById('outputImg');
+  img.src    = src;
+  if (crossOrigin) img.crossOrigin = 'anonymous';
+  img.style.display = 'block';
+  document.getElementById('captionText').textContent = '运行模型后，AI 生成的英文描述将显示在这里';
+  document.getElementById('captionText').className   = 'caption-text empty';
+}
+
+document.getElementById('fileInput').onchange = (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  setImage(URL.createObjectURL(file));
+  log('图片已选：' + file.name);
+};
+document.getElementById('btnSample1').onclick = () => {
+  setImage('https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/cats.jpg', true);
+  log('示例图片：猫咪');
+};
+document.getElementById('btnSample2').onclick = () => {
+  setImage('https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/city.jpg', true);
+  log('示例图片：街景');
+};
+
+document.getElementById('btnLoad').onclick = async () => {
+  document.getElementById('btnLoad').disabled = true;
+  log('下载模型中（~250MB 首次）...', 'info');
+  try {
+    captioner = await pipeline(
+      'image-to-text',
+      'Xenova/vit-gpt2-image-captioning',
+      { progress_callback: (p) => {
+          if (p.status === 'downloading' && p.total)
+            document.getElementById('pFill').style.width =
+              Math.round(p.loaded / p.total * 90) + '%';
+        }
+      }
+    );
+    document.getElementById('pFill').style.width = '100%';
+    log('✓ 模型就绪', 'ok');
+    document.getElementById('btnRun').disabled     = false;
+    document.getElementById('btnRunAgain').disabled = false;
+  } catch(e) {
+    log('✗ ' + e.message, 'warn');
+    document.getElementById('btnLoad').disabled = false;
+  }
+};
+
+async function runCaption() {
+  if (!captioner || !currentSrc) { log('请先加载模型并选择图片', 'warn'); return; }
+  document.getElementById('btnRun').disabled     = true;
+  document.getElementById('btnRunAgain').disabled = true;
+  log('▶ 生成中...', 'info');
+
+  try {
+    const t0 = performance.now();
+    // max_new_tokens 控制描述长度；do_sample+temperature 引入随机性
+    const result = await captioner(currentSrc, {
+      max_new_tokens: 50,
+      do_sample: runCount > 0,     // 第一次贪心，后续随机
+      temperature: 1.2,
+    });
+    const text = result[0].generated_text;
+    const ms   = (performance.now() - t0).toFixed(0);
+
+    document.getElementById('captionText').textContent = text;
+    document.getElementById('captionText').className   = 'caption-text';
+    log(`✓ 完成，耗时 ${ms}ms`, 'ok');
+
+    // 加入历史
+    const history = document.getElementById('history');
+    const item    = document.createElement('div');
+    item.className = 'history-item';
+    item.innerHTML = `<div class="hi-time">第 ${++runCount} 次 · ${ms}ms</div>${text}`;
+    history.prepend(item);
+
+  } catch(e) {
+    log('✗ ' + e.message, 'warn');
+    console.error(e);
+  }
+  document.getElementById('btnRun').disabled     = false;
+  document.getElementById('btnRunAgain').disabled = false;
+}
+
+document.getElementById('btnRun').onclick     = runCaption;
+document.getElementById('btnRunAgain').onclick = runCaption;
+</script>
+</body>
+</html>

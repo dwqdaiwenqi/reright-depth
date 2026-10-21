@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>目标检测 - Transformers.js</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #0f0f1a; color: #e2e8f0;
+           display: grid; grid-template-columns: 300px 1fr; height: 100vh; overflow: hidden; }
+
+    .sidebar { border-right: 1px solid #1e293b; display: flex; flex-direction: column; overflow-y: auto; }
+    .section { padding: 14px; border-bottom: 1px solid #1e293b; }
+    .section h2 { font-size: 0.7rem; color: #64748b; text-transform: uppercase;
+                  letter-spacing: 0.08em; margin-bottom: 10px; }
+
+    button { width: 100%; padding: 8px; border: none; border-radius: 6px;
+             background: #4f46e5; color: white; cursor: pointer; font-size: 0.82rem;
+             margin-bottom: 6px; transition: background 0.15s; }
+    button:hover:not(:disabled) { background: #4338ca; }
+    button:disabled { background: #1e293b; color: #475569; cursor: not-allowed; }
+
+    input[type=file] { font-size: 0.75rem; color: #94a3b8; width: 100%; margin-bottom: 6px; }
+    input[type=range] { flex: 1; accent-color: #4f46e5; }
+
+    .progress-bar { background: #1e293b; border-radius: 3px; height: 4px; overflow: hidden; margin: 6px 0; }
+    .progress-fill { background: #4f46e5; height: 100%; width: 0%; transition: width 0.3s; }
+
+    .param { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+    .param label { font-size: 0.75rem; color: #94a3b8; min-width: 56px; }
+    .param span { font-size: 0.72rem; color: #a5b4fc; min-width: 28px; text-align: right; }
+
+    .log { flex: 1; padding: 10px 12px; font-family: monospace; font-size: 0.7rem;
+           color: #64748b; overflow-y: auto; line-height: 1.8; }
+    .log .ok   { color: #6ee7b7; }
+    .log .info { color: #7dd3fc; }
+    .log .warn { color: #fbbf24; }
+
+    .result-list { padding: 0 14px 14px; display: flex; flex-direction: column; gap: 4px; }
+    .result-item { display: flex; align-items: center; gap: 8px; padding: 5px 8px;
+                   border-radius: 5px; background: #1e293b; font-size: 0.75rem; }
+    .result-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+    .result-label { flex: 1; color: #e2e8f0; }
+    .result-score { color: #a5b4fc; font-family: monospace; }
+
+    .canvas-wrap { position: relative; background: #000; display: flex; align-items: center; justify-content: center; }
+    #outputCanvas { max-width: 100%; max-height: 100%; display: block; }
+  </style>
+</head>
+<body>
+
+<div class="sidebar">
+  <div class="section">
+    <h2>① 选择图片</h2>
+    <input type="file" id="fileInput" accept="image/*">
+    <button id="btnSample">用示例图片（街景）</button>
+  </div>
+
+  <div class="section">
+    <h2>② 加载模型</h2>
+    <div style="font-size:0.7rem;color:#64748b;margin-bottom:6px;">DETR-ResNet-50，首次约 166MB</div>
+    <button id="btnLoad">加载 DETR 检测模型</button>
+    <div class="progress-bar"><div class="progress-fill" id="pFill"></div></div>
+    <button id="btnRun" disabled>运行目标检测</button>
+  </div>
+
+  <div class="section">
+    <h2>置信度阈值</h2>
+    <div class="param">
+      <label>阈值</label>
+      <input type="range" id="sThreshold" min="0.1" max="0.95" step="0.05" value="0.5">
+      <span id="vThreshold">0.5</span>
+    </div>
+  </div>
+
+  <div class="result-list" id="resultList"></div>
+  <div class="log" id="log"><div class="info">等待加载模型...</div></div>
+</div>
+
+<div class="canvas-wrap">
+  <canvas id="outputCanvas"></canvas>
+</div>
+
+<script type="module">
+import { pipeline, env } from './libs/transformers.min.js';
+
+env.allowLocalModels  = true;
+env.allowRemoteModels = true;
+env.localModelPath    = './models/';
+
+let detector = null;
+let currentImage = null;
+let threshold = 0.5;
+
+const COLORS = [
+  '#ef4444','#f97316','#eab308','#22c55e',
+  '#06b6d4','#6366f1','#ec4899','#14b8a6',
+];
+function labelColor(label) {
+  let h = 0;
+  for (const c of label) h = (h * 31 + c.charCodeAt(0)) & 0xffff;
+  return COLORS[h % COLORS.length];
+}
+
+function log(msg, type = 'info') {
+  const el = document.getElementById('log');
+  const d  = document.createElement('div');
+  d.className = type; d.textContent = msg;
+  el.prepend(d);
+}
+
+document.getElementById('sThreshold').oninput = (e) => {
+  threshold = parseFloat(e.target.value);
+  document.getElementById('vThreshold').textContent = threshold.toFixed(2);
+};
+
+document.getElementById('fileInput').onchange = (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const url = URL.createObjectURL(file);
+  loadImage(url);
+  log('图片已选：' + file.name, 'info');
+};
+
+document.getElementById('btnSample').onclick = () => {
+  loadImage('https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/city.jpg', true);
+  log('示例图片已选（街景）', 'info');
+};
+
+function loadImage(src, crossOrigin = false) {
+  const img = new Image();
+  if (crossOrigin) img.crossOrigin = 'anonymous';
+  img.onload = () => {
+    currentImage = img;
+    const canvas = document.getElementById('outputCanvas');
+    canvas.width  = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0);
+    log(`图片尺寸：${img.naturalWidth}×${img.naturalHeight}`, 'info');
+  };
+  img.src = src;
+}
+
+document.getElementById('btnLoad').onclick = async () => {
+  document.getElementById('btnLoad').disabled = true;
+  log('下载模型中（~166MB 首次）...', 'info');
+  try {
+    detector = await pipeline(
+      'object-detection',
+      'Xenova/detr-resnet-50',
+      { progress_callback: (p) => {
+          if (p.status === 'downloading' && p.total)
+            document.getElementById('pFill').style.width =
+              Math.round(p.loaded / p.total * 90) + '%';
+        }
+      }
+    );
+    document.getElementById('pFill').style.width = '100%';
+    log('✓ 模型就绪', 'ok');
+    document.getElementById('btnRun').disabled = false;
+  } catch(e) {
+    log('✗ ' + e.message, 'warn');
+    document.getElementById('btnLoad').disabled = false;
+  }
+};
+
+document.getElementById('btnRun').onclick = async () => {
+  if (!detector || !currentImage) { log('请先加载模型并选择图片', 'warn'); return; }
+  document.getElementById('btnRun').disabled = true;
+  log('▶ 推理中...', 'info');
+
+  try {
+    const t0 = performance.now();
+    const results = await detector(currentImage.src, { threshold });
+    log(`✓ 完成，耗时 ${(performance.now()-t0).toFixed(0)}ms，检测到 ${results.length} 个对象`, 'ok');
+
+    // 画框
+    const canvas = document.getElementById('outputCanvas');
+    const ctx    = canvas.getContext('2d');
+    ctx.drawImage(currentImage, 0, 0);
+
+    const list = document.getElementById('resultList');
+    list.innerHTML = '';
+
+    results.forEach(({ label, score, box }) => {
+      const color = labelColor(label);
+      const { xmin, ymin, xmax, ymax } = box;
+
+      ctx.strokeStyle = color;
+      ctx.lineWidth   = 3;
+      ctx.strokeRect(xmin, ymin, xmax - xmin, ymax - ymin);
+
+      // 标签背景
+      const text = `${label} ${(score*100).toFixed(0)}%`;
+      ctx.font = 'bold 14px system-ui';
+      const tw = ctx.measureText(text).width;
+      ctx.fillStyle = color;
+      ctx.fillRect(xmin, ymin - 20, tw + 8, 20);
+      ctx.fillStyle = '#fff';
+      ctx.fillText(text, xmin + 4, ymin - 5);
+
+      // 侧栏列表
+      const item = document.createElement('div');
+      item.className = 'result-item';
+      item.innerHTML = `
+        <div class="result-dot" style="background:${color}"></div>
+        <span class="result-label">${label}</span>
+        <span class="result-score">${(score*100).toFixed(1)}%</span>
+      `;
+      list.appendChild(item);
+    });
+
+  } catch(e) {
+    log('✗ ' + e.message, 'warn');
+    console.error(e);
+  }
+  document.getElementById('btnRun').disabled = false;
+};
+</script>
+</body>
+</html>
