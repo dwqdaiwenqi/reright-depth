@@ -135,172 +135,234 @@ const device  = await adapter.requestDevice();
 log('✓ WebGPU 初始化完成');
 
 
-// ─────────────────────────────────────────────────────────
-// Compute Shader（WGSL）
-// ─────────────────────────────────────────────────────────
-const shaderCode = /* wgsl */ `
-
-// 图片宽高（通过 uniform buffer 传入，避免硬编码）
-struct Params {
-  width:  u32,
-  height: u32,
-}
+// ─────────────────────────────────────────────────────────────────
+// Pipeline 1：灰度化 Shader
+// 对标 ONNX 里的 Cast + Mul + Add（预处理标准化）
+// ─────────────────────────────────────────────────────────────────
+const grayscaleShader = device.createShaderModule({ code: /* wgsl */ `
+struct Params { width: u32, height: u32 }
 @group(0) @binding(0) var<uniform>             params    : Params;
-@group(0) @binding(1) var<storage, read>       inputBuf  : array<u32>; // 输入像素（每个u32=1个RGBA像素）
-@group(0) @binding(2) var<storage, read_write> outputBuf : array<u32>; // 输出像素
+@group(0) @binding(1) var<storage, read>       inputBuf  : array<u32>;
+@group(0) @binding(2) var<storage, read_write> outputBuf : array<u32>;
 
-// ── 核心：二维 workgroup_size ───────────────────────────────
-// @workgroup_size(8, 8)：
-//   每个工作组是 8×8 的线程网格，共 64 个线程
-//   对比一维 @workgroup_size(64)：线程数一样，但坐标天然是二维的
-//
-//   对应 JS 侧：dispatchWorkgroups(W/8, H/8, 1)
-//     第1个参数 = x方向派多少组（256/8 = 32组）
-//     第2个参数 = y方向派多少组（256/8 = 32组）
-//     第3个参数 = z方向（不用，写1）
-//
-//   总线程数 = 32×32组 × 8×8线程/组 = 1024 × 64 = 65536
-//            = 256×256 图片像素数，完美覆盖
 @compute @workgroup_size(8, 8)
-fn main(
-  // global_invocation_id 现在是真正的 (x, y) 坐标：
-  //   .x = 当前线程负责的像素列（0 ~ width-1）
-  //   .y = 当前线程负责的像素行（0 ~ height-1）
-  //
-  // 和一维的区别：
-  //   一维 @workgroup_size(64)：只有 id.x，要手动算 y = id.x / width
-  //   二维 @workgroup_size(8,8)：id.x 和 id.y 直接就是像素坐标，直观
-  @builtin(global_invocation_id) id: vec3<u32>
-) {
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let x = id.x;
   let y = id.y;
-
-  // 越界检查（图片尺寸不是 workgroup_size 倍数时，边缘会有多余线程）
-  // 本例 256 正好是 8 的倍数，这行实际不会触发，但保留是好习惯
   if (x >= params.width || y >= params.height) { return; }
+  let idx = y * params.width + x; // 二维坐标 → 一维下标
 
-  // ── 关键：二维坐标 → 一维数组下标 ──────────────────────────
-  // 内存里的像素数组是一维的（一行一行存储），需要手动换算：
-  //   第 y 行的起点 = y * width
-  //   再加上列偏移 x
-  //   就像二维数组 arr[y][x] → 一维 arr[y * width + x]
-  let idx = y * params.width + x;
-
-  // ── 解包像素（u32 → RGBA 四个分量）────────────────────────
-  // inputBuf 里每个 u32 存了一个像素，字节顺序：R在低位，A在高位
-  // 内存：[R][G][B][A] → u32 = R | G<<8 | B<<16 | A<<24
   let px = inputBuf[idx];
-  let r = f32( px        & 0xFFu) / 255.0; // 取低8位 = R
-  let g = f32((px >>  8) & 0xFFu) / 255.0; // 取第9~16位 = G
-  let b = f32((px >> 16) & 0xFFu) / 255.0; // 取第17~24位 = B
+  let r = f32( px        & 0xFFu) / 255.0;
+  let g = f32((px >>  8u) & 0xFFu) / 255.0;
+  let b = f32((px >> 16u) & 0xFFu) / 255.0;
 
-  // ── 灰度公式：不是简单平均，而是按人眼敏感度加权 ──────────
-  // 人眼对绿色最敏感（0.587），对蓝色最不敏感（0.114）
-  // 这个公式来自 ITU-R BT.601 标准
+  // ITU-R BT.601 灰度公式，按人眼敏感度加权
   let gray = u32((0.299 * r + 0.587 * g + 0.114 * b) * 255.0);
-
-  // ── 重新打包：灰度图 R=G=B=gray，A保持255 ─────────────────
   outputBuf[idx] = gray | (gray << 8u) | (gray << 16u) | (0xFFu << 24u);
 }
-`;
+`});
 
-const shaderModule = device.createShaderModule({ code: shaderCode });
+// ─────────────────────────────────────────────────────────────────
+// Pipeline 2：增亮 Shader
+// 对标 ONNX 里的 Mul（把激活值乘以一个系数）
+//
+// 关键：这个 shader 的 inputBuf = Pipeline1 的 outputBuf
+//       数据从没有离开过 GPU 显存，不需要读回 CPU 再上传
+//       这就是 ONNX 里 45 个算子能高效串联的原因
+// ─────────────────────────────────────────────────────────────────
+const brightnessShader = device.createShaderModule({ code: /* wgsl */ `
+struct Params { width: u32, height: u32 }
+@group(0) @binding(0) var<uniform>             params    : Params;
+@group(0) @binding(1) var<storage, read>       inputBuf  : array<u32>; // ← Pipeline1 的输出
+@group(0) @binding(2) var<storage, read_write> outputBuf : array<u32>; // ← 最终结果
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let x = id.x;
+  let y = id.y;
+  if (x >= params.width || y >= params.height) { return; }
+  let idx = y * params.width + x;
+
+  let px = inputBuf[idx];
+  let r = f32( px        & 0xFFu);
+  let g = f32((px >>  8u) & 0xFFu);
+  let b = f32((px >> 16u) & 0xFFu);
+
+  // 每个通道乘以增亮系数 1.8，超过 255 的截断（clamp）
+  let factor = 1.8;
+  let rr = min(u32(r * factor), 255u);
+  let gg = min(u32(g * factor), 255u);
+  let bb = min(u32(b * factor), 255u);
+
+  outputBuf[idx] = rr | (gg << 8u) | (bb << 16u) | (0xFFu << 24u);
+}
+`});
 
 
-// ── 按钮点击：执行 GPU 计算 ──────────────────────────────────────────
+// ── 按钮点击：串联执行两个 Pipeline ────────────────────────────────
 document.getElementById('btn').onclick = async () => {
   document.getElementById('log').innerHTML = '';
+  document.getElementById('midCanvas').style.filter    = 'brightness(0.3)';
   document.getElementById('outputCanvas').style.filter = 'brightness(0.3)';
-  log('▶ 开始 GPU 灰度转换...', 'info');
+  log('▶ 开始串联 GPU 处理...', 'info');
 
   const t0 = performance.now();
-  const byteSize = W * H * 4; // 256×256 像素 × 4字节/像素 = 262144 字节
+  const byteSize = W * H * 4;
+  const wgX = Math.ceil(W / 8);
+  const wgY = Math.ceil(H / 8);
 
-  // ── 创建 GPU Buffer ──────────────────────────────────────────────
-  // 1. Uniform Buffer：传图片宽高给 shader
-  //    uniform 是只读的小数据（不超过64KB），适合传参数
-  //    （对比 storage：可读写，适合大数据）
+  // ── Uniform Buffer（两个 pipeline 共用同一份宽高参数）──────────
   const paramsBuffer = device.createBuffer({
-    size:  16,   // Struct { width: u32, height: u32 } = 8字节，但 uniform 要求最少16字节对齐
+    size: 16,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
   device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([W, H, 0, 0]));
 
-  // 2. 输入 buffer：上传原图像素数据
+  // ── Buffer 链：体现 Pipeline 间数据传递的核心 ───────────────────
+  //
+  //   inputBuffer  →[Pipeline1]→  midBuffer  →[Pipeline2]→  outputBuffer
+  //                               ↑ 这个 buffer 同时是 P1 的输出和 P2 的输入
+  //                               usage 必须同时包含 STORAGE（两个 pipeline 都要读写它）
+  //
+  // inputBuffer：原图，CPU → GPU，只写一次
   const inputBuffer = device.createBuffer({
     size:  byteSize,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   });
   device.queue.writeBuffer(inputBuffer, 0, inputPixels);
 
-  // 3. 输出 buffer：GPU 写入灰度结果
+  // midBuffer：Pipeline1 输出 / Pipeline2 输入，纯 GPU 内部中转
+  // 对标 ONNX 里那个 128MB 的大 Buffer，存中间激活值
+  // 注意：COPY_SRC 是为了后面把中间结果读回 CPU 显示，生产环境里不需要
+  const midBuffer = device.createBuffer({
+    size:  byteSize,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    //     ↑ STORAGE：Pipeline1写入 + Pipeline2读取都需要它
+  });
+
+  // outputBuffer：Pipeline2 最终输出
   const outputBuffer = device.createBuffer({
     size:  byteSize,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
   });
 
-  // 4. 回读 buffer：把 GPU 结果读回 CPU
-  const readbackBuffer = device.createBuffer({
+  // readbackBuffer：GPU → CPU 读回，只用于在 canvas 上显示
+  const midReadback = device.createBuffer({
+    size:  byteSize,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+  const outReadback = device.createBuffer({
     size:  byteSize,
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
   });
 
-  log(`✓ 创建 4 个 GPU Buffer（共 ${(byteSize * 3 / 1024).toFixed(0)} KB 显存）`);
+  log(`✓ 创建 6 个 GPU Buffer：input → mid → output + 2个回读`);
 
-  // ── 创建计算管线 ─────────────────────────────────────────────────
-  const pipeline = device.createComputePipeline({
+  // ── 创建两个 Pipeline ─────────────────────────────────────────
+  const pipeline1 = device.createComputePipeline({
     layout: 'auto',
-    compute: { module: shaderModule, entryPoint: 'main' },
+    compute: { module: grayscaleShader, entryPoint: 'main' },
+    // label 对应 Inspector 里看到的名字，方便调试
+    // （ONNX 里就是用 label: 'Cast' / 'Mul' / 'Add' 来标记的）
+    label: 'Grayscale',
   });
 
-  const bindGroup = device.createBindGroup({
-    layout: pipeline.getBindGroupLayout(0),
+  const pipeline2 = device.createComputePipeline({
+    layout: 'auto',
+    compute: { module: brightnessShader, entryPoint: 'main' },
+    label: 'Brightness',
+  });
+
+  // ── BindGroup：把 Buffer 绑到对应的 @binding 插槽 ─────────────
+  // Pipeline1 的 BindGroup：input → mid
+  const bindGroup1 = device.createBindGroup({
+    layout: pipeline1.getBindGroupLayout(0),
     entries: [
-      { binding: 0, resource: { buffer: paramsBuffer  } }, // 宽高参数
-      { binding: 1, resource: { buffer: inputBuffer   } }, // 原图像素
-      { binding: 2, resource: { buffer: outputBuffer  } }, // 灰度结果
+      { binding: 0, resource: { buffer: paramsBuffer } },
+      { binding: 1, resource: { buffer: inputBuffer  } }, // 读：原图
+      { binding: 2, resource: { buffer: midBuffer    } }, // 写：灰度结果
     ],
   });
 
-  // ── 录制并提交命令 ───────────────────────────────────────────────
+  // Pipeline2 的 BindGroup：mid → output
+  // 关键：binding(1) 绑的是 midBuffer，和 Pipeline1 的 binding(2) 是同一个 Buffer
+  // 这就是"Pipeline1 的输出 = Pipeline2 的输入"在代码里的体现
+  const bindGroup2 = device.createBindGroup({
+    layout: pipeline2.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: paramsBuffer } },
+      { binding: 1, resource: { buffer: midBuffer    } }, // 读：Pipeline1 写入的灰度结果
+      { binding: 2, resource: { buffer: outputBuffer } }, // 写：增亮结果
+    ],
+  });
+
+  // ── 录制命令：一个 CommandEncoder 录制两个 ComputePass ──────────
+  // 对应 Inspector 里 Record 时看到的那个命令列表：
+  //   ComputePass (label: Grayscale)   ← Pipeline1
+  //     setPipeline / setBindGroup / dispatchWorkgroups
+  //   ComputePass (label: Brightness)  ← Pipeline2
+  //     setPipeline / setBindGroup / dispatchWorkgroups
+  //   copyBufferToBuffer (mid → midReadback)
+  //   copyBufferToBuffer (output → outReadback)
   const encoder = device.createCommandEncoder();
-  const pass    = encoder.beginComputePass();
-  pass.setPipeline(pipeline);
-  pass.setBindGroup(0, bindGroup);
 
-  // ── 关键：二维 dispatch ────────────────────────────────────────
-  // 一维例子用的是 dispatchWorkgroups(N)
-  // 二维图像用 dispatchWorkgroups(x方向组数, y方向组数)
-  //
-  // 256 × 256 图片，@workgroup_size(8, 8)：
-  //   x方向：256 / 8 = 32 个工作组
-  //   y方向：256 / 8 = 32 个工作组
-  //   总工作组 = 32 × 32 = 1024 个，每组 64 线程，共 65536 线程
-  //   正好 = 256 × 256 像素数，一线程处理一像素，完美覆盖
-  const wgX = Math.ceil(W / 8); // x方向工作组数 = 32
-  const wgY = Math.ceil(H / 8); // y方向工作组数 = 32
-  pass.dispatchWorkgroups(wgX, wgY);
-  log(`✓ dispatchWorkgroups(${wgX}, ${wgY}) → ${wgX * wgY} 个工作组 × 64 线程 = ${wgX * wgY * 64} 线程`);
+  // ── Pass 1：灰度化 ─────────────────────────────────────────────
+  const pass1 = encoder.beginComputePass({ label: 'Grayscale' });
+  pass1.setPipeline(pipeline1);
+  pass1.setBindGroup(0, bindGroup1);
+  pass1.dispatchWorkgroups(wgX, wgY); // input → mid
+  pass1.end();
+  log(`✓ Pass1 Grayscale dispatched`);
 
-  pass.end();
+  // ── Pass 2：增亮 ───────────────────────────────────────────────
+  // GPU 保证 Pass1 执行完毕后才开始 Pass2（因为 Pass2 依赖 Pass1 的输出）
+  // 不需要任何显式同步，WebGPU 的 submit 顺序就保证了这一点
+  const pass2 = encoder.beginComputePass({ label: 'Brightness' });
+  pass2.setPipeline(pipeline2);
+  pass2.setBindGroup(0, bindGroup2);
+  pass2.dispatchWorkgroups(wgX, wgY); // mid → output
+  pass2.end();
+  log(`✓ Pass2 Brightness dispatched`);
 
-  encoder.copyBufferToBuffer(outputBuffer, 0, readbackBuffer, 0, byteSize);
+  // 把两个中间结果都拷贝出来，以便在 canvas 上分别显示
+  encoder.copyBufferToBuffer(midBuffer,    0, midReadback, 0, byteSize);
+  encoder.copyBufferToBuffer(outputBuffer, 0, outReadback, 0, byteSize);
+
+  // 一次 submit 提交所有命令，GPU 按顺序执行
   device.queue.submit([encoder.finish()]);
 
-  // ── 读回结果并显示 ───────────────────────────────────────────────
-  await readbackBuffer.mapAsync(GPUMapMode.READ);
-  const result = new Uint8Array(readbackBuffer.getMappedRange());
+  // ── 读回并显示中间结果（灰度）─────────────────────────────────
+  await midReadback.mapAsync(GPUMapMode.READ);
+  const midResult = new Uint8Array(midReadback.getMappedRange());
+  const midCanvas = document.getElementById('midCanvas');
+  const midCtx    = midCanvas.getContext('2d');
+  const midImgData = midCtx.createImageData(W, H);
+  midImgData.data.set(midResult);
+  midCtx.putImageData(midImgData, 0, 0);
+  midCanvas.style.filter = '';
+  midReadback.unmap();
 
-  // 把 GPU 输出的像素数据写到 outputCanvas 上显示
+  // ── 读回并显示最终结果（增亮）────────────────────────────────
+  await outReadback.mapAsync(GPUMapMode.READ);
+  const outResult = new Uint8Array(outReadback.getMappedRange());
   const outputCanvas = document.getElementById('outputCanvas');
-  const outCtx = outputCanvas.getContext('2d');
-  const outImageData = outCtx.createImageData(W, H);
-  outImageData.data.set(result);
-  outCtx.putImageData(outImageData, 0, 0);
-  outputCanvas.style.filter = ''; // 取消暗化
-
-  readbackBuffer.unmap();
+  const outCtx       = outputCanvas.getContext('2d');
+  const outImgData   = outCtx.createImageData(W, H);
+  outImgData.data.set(outResult);
+  outCtx.putImageData(outImgData, 0, 0);
+  outputCanvas.style.filter = '';
+  outReadback.unmap();
 
   const ms = (performance.now() - t0).toFixed(2);
-  log(`✓ GPU 灰度转换完成，耗时 ${ms}ms（处理了 ${W * H} 个像素）`, 'ok');
+  log(`✓ 串联处理完成，耗时 ${ms}ms`, 'ok');
+  log(`  midBuffer 全程留在 GPU 显存，没有经过 CPU`, 'info');
 };
+
+// ── 空的 rAF 循环，让 Inspector Immediate 模式能抓帧 ─────────────────
+// Inspector 的 Immediate 模式靠 requestAnimationFrame 来判断"一帧"的边界
+// 没有 rAF 循环它就不知道何时是一帧的开始和结束，抓不到任何东西
+// 这个循环本身什么都不做，只是让 Inspector 能工作
+// 按钮点击触发的 GPU 命令会在某一帧的 rAF 回调期间或之后 submit，
+// Inspector 会把它归入最近的那一帧
+(function rafLoop() { requestAnimationFrame(rafLoop); })();

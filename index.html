@@ -390,6 +390,25 @@ function log(msg, type = 'info') {
 }
 
 // ── ① 加载模型 ───────────────────────────────────────
+//
+// pipeline() 做了什么：
+//   1. 下载 ONNX 模型文件（.onnx = 通用 AI 模型格式，和框架无关）
+//   2. 解析模型结构：45个算子（Cast/Mul/Add/Conv...）串成一张计算图
+//   3. 为每个算子生成一个 WebGPU Compute Pipeline + Shader Module
+//      → 这就是你在 Inspector 里看到 Compute Pipelines 45 = Shader Modules 45 的原因
+//   4. 把模型权重（神经网络学到的参数）上传到 GPU 显存 Buffer
+//      → Inspector 里 Buffers 里那个 128MB 的大 buffer 就是权重
+//
+// device: 'webgpu' vs 'wasm'
+//   webgpu：用 GPU 跑，快（用 Compute Shader 并行计算）
+//   wasm：用 CPU 跑，慢（WebAssembly，没有 GPU 加速）
+//
+// dtype（数据精度）对比：
+//   fp32：每个数字 4字节，精度最高，最慢最占显存
+//   fp16：每个数字 2字节，精度略低，速度翻倍，显存减半（AI推理够用）
+//   q8 ：每个数字 1字节，精度再低一点，更快更省，效果仍可接受
+//   q4 ：每个数字 0.5字节，最小最快，精度损失较明显
+//   → Inspector 里看到 "enable f16" 就是因为用了半精度模式
 document.getElementById('btnLoad').onclick = async () => {
   document.getElementById('btnLoad').disabled = true;
   log('下载模型中（~50MB 首次）...', 'info');
@@ -493,6 +512,52 @@ document.getElementById('depthInput').onchange = (e) => {
 };
 
 // ── ③ 运行深度估计 → 生成 Three.js 纹理 ─────────────
+//
+// depthPipeline(imageSrc) 内部发生了什么：
+//
+//   输入图片（你的猫图）
+//     ↓ 解码成像素数组 Uint8Array [R,G,B,A, R,G,B,A, ...]
+//     ↓
+//   算子1 Cast（Inspector里的 ShaderModule 1）：
+//     input  = 上面的像素整数数组（每个值 0~255）
+//     output = 转成 f32 浮点数组（每个值 0.0~1.0）
+//     GPU Buffer: { size: ~几MB, usage: STORAGE }
+//     ↓
+//   算子2 Mul（ShaderModule 2）：
+//     input  = 上面的 f32 数组
+//     output = × 归一化系数（让像素值符合模型训练时的范围）
+//     ↓
+//   算子3 Add（ShaderModule 3）：
+//     input  = 上面的数组
+//     output = - 均值（标准化，让数据分布在0附近）
+//     ↓
+//   算子4~44 Conv/MatMul/Attention...（神经网络的核心计算）：
+//     这些是真正"理解图片内容"的部分
+//     每个算子的 input = 上一个算子的 output（中间激活值）
+//     中间激活值存在那个 128MB 的大 Buffer 里
+//     ↓
+//   算子45 TransposeCopy（ShaderModule 45）：
+//     output = 深度图，每个像素一个值（0=近，255=远）
+//
+//   执行顺序（你在 Inspector 截图里看到的顺序）：
+//   1.Cast → 2.Mul → 3.Mul → 4.Add → 5.Expand → 6.TransposeCopy
+//   → 7.Concat → 8.TransposeShared → 9.Resize → 10.Concat → 11.Add
+//   → 12.ReduceMeanShared → 13.Sub → 14.Pow → 15.Add → 16.Sqrt → 17.Div
+//   → ... → 45.Add（最终深度图）
+//
+//   是按顺序 1→45 执行吗？
+//   基本是，但准确说是"拓扑顺序"：
+//     ONNX 建了一张计算图（有向无环图），每个算子是一个节点
+//     后面的算子依赖前面算子的输出，所以必须等前一个跑完才能开始
+//     这个模型基本是线性链路，所以看起来就是 1→45 顺序执行
+//
+//   注意 Inspector 里 ID 不是连续的（499,507,513...723...2116...）
+//   ID 是创建时分配的全局编号，不代表执行顺序
+//   执行顺序由计算图的依赖关系决定，和 ID 大小无关
+//
+//   全程 45 个 Compute Shader 依次提交到 GPU queue，GPU 顺序执行
+//   最后 Transformers.js 把结果从 GPU 读回 CPU（mapAsync）
+//   返回给你的 output.depth 就是这个读回来的数组
 document.getElementById('btnRun').onclick = async () => {
   if (!depthPipeline || !currentImageSrc) {
     log('请先加载模型并选择图片', 'warn'); return;
@@ -502,6 +567,7 @@ document.getElementById('btnRun').onclick = async () => {
 
   try {
     const t0 = performance.now();
+    // 这一行触发上面描述的全部 45 个 GPU Compute Shader 依次执行
     const output = await depthPipeline(currentImageSrc);
     const tInfer = performance.now();
     log(`  推理耗时：${(tInfer - t0).toFixed(0)}ms`, 'info');

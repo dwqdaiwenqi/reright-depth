@@ -29,24 +29,32 @@
   </style>
 </head>
 <body>
-  <h1>WebGPU 03 · 2D 计算管线（图像处理）</h1>
-  <p>任务：用 GPU 把彩色图片转成灰度图<br>
-     <code style="color:#a5b4fc">@workgroup_size(8, 8)</code> — 每个工作组同时处理 8×8 = 64 个像素</p>
+  <h1>WebGPU 03 · 串联计算管线（模拟 ONNX 多算子）</h1>
+  <p>两个 Pipeline 串联：Pipeline1 灰度化 → Pipeline2 增亮<br>
+     Pipeline1 的 output Buffer 直接成为 Pipeline2 的 input Buffer，全程不经过 CPU</p>
 
   <div class="canvases">
     <div class="canvas-box">
-      <h2>原图（CPU 生成）</h2>
+      <h2>① 原图（CPU）</h2>
       <canvas id="inputCanvas" width="256" height="256"></canvas>
     </div>
-    <div class="arrow">→</div>
+    <div class="arrow">
+      →<div style="font-size:0.6rem;color:#4f46e5;margin-top:4px">Pipeline 1<br>灰度化</div>
+    </div>
     <div class="canvas-box">
-      <h2>GPU 处理后（灰度）</h2>
-      <canvas id="outputCanvas" width="256" height="256"
-              style="filter:brightness(0.3)"></canvas>
+      <h2>② 灰度（GPU 中间结果）</h2>
+      <canvas id="midCanvas" width="256" height="256" style="filter:brightness(0.3)"></canvas>
+    </div>
+    <div class="arrow">
+      →<div style="font-size:0.6rem;color:#4f46e5;margin-top:4px">Pipeline 2<br>增亮</div>
+    </div>
+    <div class="canvas-box">
+      <h2>③ 增亮（GPU 最终输出）</h2>
+      <canvas id="outputCanvas" width="256" height="256" style="filter:brightness(0.3)"></canvas>
     </div>
   </div>
 
-  <button id="btn">GPU 转灰度</button>
+  <button id="btn">GPU 串联处理</button>
   <div id="log"></div>
 
 <script type="module" src="./03-compute-2d.js"></script>
