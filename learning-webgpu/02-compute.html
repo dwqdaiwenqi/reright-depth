@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <title>WebGPU 02 - 计算管线</title>
+  <style>
+    body { margin: 0; background: #0f0f1a; display: flex; flex-direction: column;
+           align-items: center; justify-content: center; min-height: 100vh;
+           font-family: system-ui; color: #e2e8f0; padding: 24px; }
+    h1 { font-size: 1rem; color: #64748b; margin-bottom: 8px; }
+    p  { font-size: 0.8rem; color: #475569; margin-bottom: 24px; text-align: center; }
+
+    button { padding: 10px 24px; background: #4f46e5; color: white; border: none;
+             border-radius: 6px; cursor: pointer; font-size: 0.9rem; margin-bottom: 24px; }
+    button:hover { background: #4338ca; }
+
+    .box { background: #1e293b; border: 1px solid #334155; border-radius: 8px;
+           padding: 20px; width: 100%; max-width: 560px; }
+    .box h2 { font-size: 0.7rem; color: #64748b; text-transform: uppercase;
+              letter-spacing: 0.08em; margin-bottom: 12px; }
+
+    .nums { display: flex; flex-wrap: wrap; gap: 6px; }
+    .num  { background: #0f172a; border: 1px solid #1e293b; border-radius: 4px;
+            padding: 4px 8px; font-size: 0.78rem; font-family: monospace; color: #a5b4fc; }
+    .num.result { color: #6ee7b7; border-color: #065f46; }
+
+    #log { margin-top: 16px; font-size: 0.75rem; color: #64748b;
+           font-family: monospace; line-height: 1.8; }
+    .ok   { color: #6ee7b7; }
+    .info { color: #7dd3fc; }
+  </style>
+</head>
+<body>
+  <h1>WebGPU 02 · 计算管线</h1>
+  <p>任务：把数组 [1, 2, 3 ... 16] 每个元素都乘以 2，用 GPU 并行计算</p>
+  <button id="btn">在 GPU 上计算</button>
+
+  <div class="box">
+    <h2>输入数组（CPU 准备）</h2>
+    <div class="nums" id="inputNums"></div>
+  </div>
+
+  <br>
+
+  <div class="box">
+    <h2>输出数组（GPU 计算结果）</h2>
+    <div class="nums" id="outputNums"><span style="color:#475569;font-size:0.8rem">点击按钮后显示</span></div>
+  </div>
+
+  <div id="log"></div>
+
+<script type="module" src="./02-compute.js"></script>
+</body>
+</html>

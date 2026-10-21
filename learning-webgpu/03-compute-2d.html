@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <title>WebGPU 03 - 2D 计算管线</title>
+  <style>
+    body { margin: 0; background: #0f0f1a; display: flex; flex-direction: column;
+           align-items: center; justify-content: center; min-height: 100vh;
+           font-family: system-ui; color: #e2e8f0; padding: 24px; gap: 20px; }
+    h1 { font-size: 1rem; color: #64748b; margin: 0; }
+    p  { font-size: 0.8rem; color: #475569; margin: 0; text-align: center; max-width: 560px; }
+
+    .canvases { display: flex; align-items: center; gap: 24px; }
+    .canvas-box { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+    .canvas-box h2 { font-size: 0.7rem; color: #64748b; text-transform: uppercase;
+                     letter-spacing: 0.08em; margin: 0; }
+    canvas { border-radius: 6px; border: 1px solid #334155; display: block; }
+    .arrow { font-size: 2rem; color: #334155; }
+
+    button { padding: 10px 32px; background: #4f46e5; color: white; border: none;
+             border-radius: 6px; cursor: pointer; font-size: 0.9rem; }
+    button:hover { background: #4338ca; }
+
+    #log { font-size: 0.75rem; color: #64748b; font-family: monospace;
+           line-height: 1.8; text-align: center; }
+    .ok   { color: #6ee7b7; }
+    .info { color: #7dd3fc; }
+    .warn { color: #fbbf24; }
+  </style>
+</head>
+<body>
+  <h1>WebGPU 03 · 2D 计算管线（图像处理）</h1>
+  <p>任务：用 GPU 把彩色图片转成灰度图<br>
+     <code style="color:#a5b4fc">@workgroup_size(8, 8)</code> — 每个工作组同时处理 8×8 = 64 个像素</p>
+
+  <div class="canvases">
+    <div class="canvas-box">
+      <h2>原图（CPU 生成）</h2>
+      <canvas id="inputCanvas" width="256" height="256"></canvas>
+    </div>
+    <div class="arrow">→</div>
+    <div class="canvas-box">
+      <h2>GPU 处理后（灰度）</h2>
+      <canvas id="outputCanvas" width="256" height="256"
+              style="filter:brightness(0.3)"></canvas>
+    </div>
+  </div>
+
+  <button id="btn">GPU 转灰度</button>
+  <div id="log"></div>
+
+<script type="module" src="./03-compute-2d.js"></script>
+</body>
+</html>

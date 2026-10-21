@@ -158,7 +158,7 @@ const geo = new THREE.PlaneGeometry(2, 2);
 //   3. 加 Blinn-Phong 高光
 //   4. 简单光线步进（ray march）算软阴影
 const vertShader = /*glsl*/`
-  varying vec2 vUv;
+  out vec2 vUv;           // WebGL1: varying vec2 vUv;
   void main() {
     vUv = uv;
     gl_Position = vec4(position, 1.0);
@@ -167,7 +167,7 @@ const vertShader = /*glsl*/`
 
 const fragShader = /*glsl*/`
   precision highp float;
-  varying vec2 vUv;
+  in vec2 vUv;              // WebGL1: varying vec2 vUv;
 
   uniform sampler2D uImage;      // 原始图像
   uniform sampler2D uDepth;      // 深度图（灰度，0=近，1=远）
@@ -178,9 +178,11 @@ const fragShader = /*glsl*/`
   uniform float     uAmbient;    // 环境光
   uniform vec2      uResolution; // 画布尺寸
 
+  out vec4 fragColor;       // WebGL1: 直接写 gl_FragColor，WebGL2 需要显式声明输出
+
   // 从深度图采样深度值
   float getDepth(vec2 uv) {
-    return texture2D(uDepth, uv).r;
+    return texture(uDepth, uv).r;  // WebGL1: texture2D(...)
   }
 
   void main() {
@@ -305,9 +307,9 @@ const fragShader = /*glsl*/`
     shadow = clamp(shadow, 0.5, 1.0);
 
     // ⑥ 合成
-    vec4  color   = texture2D(uImage, vUv);
+    vec4  color   = texture(uImage, vUv);  // WebGL1: texture2D(...)
     float light   = uAmbient + (diffuse + spec) * uIntensity * shadow;
-    gl_FragColor  = vec4(color.rgb * light, color.a);
+    fragColor     = vec4(color.rgb * light, color.a);  // WebGL1: gl_FragColor = ...
   }
 `;
 
@@ -322,7 +324,12 @@ const uniforms = {
   uResolution: { value: new THREE.Vector2(512, 512) },
 };
 
-const mat  = new THREE.ShaderMaterial({ vertexShader: vertShader, fragmentShader: fragShader, uniforms });
+const mat  = new THREE.ShaderMaterial({
+  vertexShader:   vertShader,
+  fragmentShader: fragShader,
+  uniforms,
+  glslVersion: THREE.GLSL3,   // 让 Three.js 注入 #version 300 es，启用 WebGL2 GLSL
+});
 const mesh = new THREE.Mesh(geo, mat);
 scene.add(mesh);
 
@@ -378,6 +385,8 @@ function log(msg, type = 'info') {
   const d  = document.createElement('div');
   d.className = type; d.textContent = msg;
   el.prepend(d);
+
+  console.log('msg',msg)
 }
 
 // ── ① 加载模型 ───────────────────────────────────────
@@ -385,10 +394,22 @@ document.getElementById('btnLoad').onclick = async () => {
   document.getElementById('btnLoad').disabled = true;
   log('下载模型中（~50MB 首次）...', 'info');
   try {
+    const webgpuSupported = !!navigator.gpu;
+    const device = webgpuSupported ? 'webgpu' : 'wasm';
+    // const device = 'wasm';
+    log(`后端：${device}`, 'info');
+
     depthPipeline = await pipeline(
       'depth-estimation',
       'onnx-community/depth-anything-v2-small',
-      { progress_callback: (p) => {
+      {
+        device,
+        // 'fp32'	model.onnx	你本地有的
+        // 'fp16'	model_fp16.onnx	WebGPU 默认，需要单独下载
+        // 'q8'	model_q8.onnx	8位量化，更小
+        // 'q4'	model_q4.onnx	4位量化，最小最快
+        dtype: 'q8', // model_q8.onnx（本地无） 改用方案见注释
+        progress_callback: (p) => {
           if (p.status === 'downloading' && p.total) {
             document.getElementById('pFill').style.width =
               Math.round(p.loaded / p.total * 90) + '%';
@@ -397,7 +418,7 @@ document.getElementById('btnLoad').onclick = async () => {
       }
     );
     document.getElementById('pFill').style.width = '100%';
-    log('✓ 模型就绪', 'ok');
+    log(`✓ 模型就绪（${device}）`, 'ok');
     document.getElementById('btnRun').disabled = false;
   } catch(e) {
     log('✗ ' + e.message, 'warn');
@@ -482,7 +503,8 @@ document.getElementById('btnRun').onclick = async () => {
   try {
     const t0 = performance.now();
     const output = await depthPipeline(currentImageSrc);
-    log(`✓ 深度估计完成，耗时 ${(performance.now()-t0).toFixed(0)}ms`, 'ok');
+    const tInfer = performance.now();
+    log(`  推理耗时：${(tInfer - t0).toFixed(0)}ms`, 'info');
 
     // ── 把原图加载为 Three.js 纹理 ────────────────────
     const imgTex = new THREE.TextureLoader().load(currentImageSrc);
@@ -490,7 +512,6 @@ document.getElementById('btnRun').onclick = async () => {
     uniforms.uImage.value = imgTex;
 
     // ── 把深度图（灰度 RawImage）画到 canvas，转为纹理 ─
-    // output.depth 是 RawImage { data: Uint8Array, width, height, channels:1 }
     const { depth } = output;
     const depthCanvas = document.createElement('canvas');
     depthCanvas.width  = depth.width;
@@ -518,7 +539,9 @@ document.getElementById('btnRun').onclick = async () => {
     depthTex.flipY  = true;
     uniforms.uDepth.value = depthTex;
 
-    log(`✓ 深度图已传入 shader（${depth.width}×${depth.height}）`, 'ok');
+    const tPost = performance.now();
+    log(`  后处理耗时：${(tPost - tInfer).toFixed(0)}ms`, 'info');
+    log(`✓ 深度估计完成，总耗时 ${(tPost - t0).toFixed(0)}ms（${depth.width}×${depth.height}）`, 'ok');
     log('移动鼠标查看动态打光效果', 'info');
 
   } catch(e) {
