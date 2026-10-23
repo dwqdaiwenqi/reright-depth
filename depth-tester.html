@@ -204,6 +204,38 @@
     color: var(--muted); font-size: 13px; border-radius: 8px;
     border: 2px dashed var(--border);
   }
+
+  /* source toggle */
+  .seg {
+    display: flex; border: 1px solid var(--border); border-radius: 7px; overflow: hidden;
+  }
+  .seg label {
+    padding: 5px 14px; cursor: pointer; font-size: 12px; font-weight: 500;
+    color: var(--muted); transition: background .15s, color .15s; white-space: nowrap;
+  }
+  .seg input[type=radio] { display: none; }
+  .seg input[type=radio]:checked + label {
+    background: var(--accent); color: #fff;
+  }
+
+  /* webgpu controls */
+  #wgpuControls { display: none; align-items: center; gap: 10px; flex-wrap: wrap; }
+  #wgpuControls.visible { display: flex; }
+  .progress-wrap {
+    height: 4px; background: var(--border); border-radius: 2px; width: 160px; overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%; background: var(--accent2); border-radius: 2px;
+    width: 0%; transition: width .2s;
+  }
+  .btn-sm {
+    background: var(--accent2); color: #0f1117; border: none; border-radius: 6px;
+    padding: 5px 14px; font-family: inherit; font-size: 12px; font-weight: 600;
+    cursor: pointer; transition: opacity .15s; white-space: nowrap;
+  }
+  .btn-sm:hover:not(:disabled) { opacity: .85; }
+  .btn-sm:disabled { opacity: .4; cursor: not-allowed; }
+  .wgpu-status { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); }
 </style>
 
 <div class="page">
@@ -214,17 +246,33 @@
 
   <div class="config">
     <div class="config-group">
+      <label>Source</label>
+      <div class="seg">
+        <input type="radio" name="src" id="srcPython" value="python" checked>
+        <label for="srcPython">Python Server</label>
+        <input type="radio" name="src" id="srcWgpu" value="webgpu">
+        <label for="srcWgpu">WebGPU Browser</label>
+      </div>
+    </div>
+
+    <!-- Python server controls -->
+    <div class="config-group" id="pythonControls">
       <div class="status-dot" id="dot"></div>
       <label>Server</label>
-      <input type="text" id="serverUrl" value="http://localhost:8080" placeholder="http://localhost:7860">
-    </div>
-    <div class="config-group">
+      <input type="text" id="serverUrl" value="http://localhost:7860" placeholder="http://localhost:7860">
       <label>Model</label>
       <select id="sizeGlobal">
         <option value="small">small (~100 MB)</option>
         <option value="base">base (~400 MB)</option>
         <option value="large">large (~1.3 GB)</option>
       </select>
+    </div>
+
+    <!-- WebGPU controls -->
+    <div id="wgpuControls">
+      <button class="btn-sm" id="btnLoadModel">Load Model</button>
+      <div class="progress-wrap"><div class="progress-fill" id="pFill"></div></div>
+      <span class="wgpu-status" id="wgpuStatus">model not loaded</span>
     </div>
   </div>
 
@@ -398,6 +446,27 @@ function loadFile(file) {
 
 $('scale').addEventListener('input', () => { $('scaleVal').textContent = $('scale').value })
 
+// ── source toggle ──────────────────────────────────────
+document.querySelectorAll('input[name=src]').forEach(r => {
+  r.addEventListener('change', () => {
+    const isWgpu = r.value === 'webgpu'
+    $('pythonControls').style.display = isWgpu ? 'none' : ''
+    $('wgpuControls').classList.toggle('visible', isWgpu)
+  })
+})
+
+// ── shared: show depth result + feed to Three.js ──────
+function showDepthResult(depthDataUrl, elapsed) {
+  const resultImg = document.createElement('img')
+  resultImg.src = depthDataUrl
+  resultImg.style.width = '100%'
+  $('resultWrap').innerHTML = ''
+  $('resultWrap').appendChild(resultImg)
+  $('timing').textContent = `${elapsed}s`
+  log(`done in ${elapsed}s`, 'ok')
+  applyToLighting(currentObjectURL, depthDataUrl)
+}
+
 // ── run depth ─────────────────────────────────────────
 $('runBtn').addEventListener('click', async () => {
   if (!currentFile || busy) return
@@ -405,44 +474,45 @@ $('runBtn').addEventListener('click', async () => {
   $('runBtn').disabled = true
   $('btnIcon').textContent = '⏳'
   $('btnLabel').textContent = 'Running…'
-  setDot('busy')
   logClear()
 
-  const server = $('serverUrl').value.replace(/\/$/, '')
-  const size   = $('sizeLocal').value || $('sizeGlobal').value
-  log(`POST ${server}/depth  size=${size}`, 'info')
-
-  const form = new FormData()
-  form.append('image', currentFile)
-  form.append('size', size)
-
+  const source = document.querySelector('input[name=src]:checked').value
   const t0 = performance.now()
+
   try {
-    const res = await fetch(`${server}/depth`, { method: 'POST', body: form })
-    const elapsed = ((performance.now() - t0) / 1000).toFixed(2)
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`)
-    const data = await res.json()
-    if (data.error) throw new Error(data.error)
+    if (source === 'python') {
+      // ── Python server path ─────────────────────────
+      setDot('busy')
+      const server = $('serverUrl').value.replace(/\/$/, '')
+      const size   = $('sizeLocal').value || $('sizeGlobal').value
+      log(`POST ${server}/depth  size=${size}`, 'info')
 
-    const depthDataUrl = `data:image/png;base64,${data.depth}`
+      const form = new FormData()
+      form.append('image', currentFile)
+      form.append('size', size)
 
-    // show depth map
-    const resultImg = document.createElement('img')
-    resultImg.src = depthDataUrl
-    resultImg.style.width = '100%'
-    $('resultWrap').innerHTML = ''
-    $('resultWrap').appendChild(resultImg)
+      const res = await fetch(`${server}/depth`, { method: 'POST', body: form })
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`)
+      const data = await res.json()
+      if (data.error) throw new Error(data.error)
 
-    $('timing').textContent = `${elapsed}s`
-    log(`done in ${elapsed}s`, 'ok')
-    setDot('ok')
+      const elapsed = ((performance.now() - t0) / 1000).toFixed(2)
+      setDot('ok')
+      showDepthResult(`data:image/png;base64,${data.depth}`, elapsed)
 
-    // feed to three.js lighting
-    applyToLighting(currentObjectURL, depthDataUrl)
+    } else {
+      // ── WebGPU / Transformers.js path ──────────────
+      if (!window.__wgpu?.ready) throw new Error('model not loaded — click Load Model first')
+      log('running depth via WebGPU…', 'info')
+
+      const depthDataUrl = await window.__wgpu.runDepth(currentObjectURL)
+      const elapsed = ((performance.now() - t0) / 1000).toFixed(2)
+      showDepthResult(depthDataUrl, elapsed)
+    }
 
   } catch (e) {
     log(e.message, 'err')
-    setDot('err')
+    if (source === 'python') setDot('err')
   } finally {
     busy = false
     $('runBtn').disabled = false
@@ -771,4 +841,113 @@ $('sHeight').addEventListener('input', e => {
   $('vHeight').textContent = val.toFixed(2)
   lightPos.z = val
 })
+</script>
+
+<!-- ── Transformers.js WebGPU depth estimation (ES Module) ── -->
+<script type="module">
+// ── 为什么用 type="module" 单独写？────────────────────────
+//   Transformers.js 只有 ESM 格式，必须用 import 语法
+//   主 script 是 classic script（加载 Three.js 全局变量）
+//   两者不能混用，所以分开写，通过 window.__wgpu 共享接口
+import { pipeline, env }
+  from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.3';
+
+// 从本地 models/ 目录加载，不走网络
+env.allowLocalModels  = true;
+env.allowRemoteModels = false;
+env.localModelPath    = './models/';
+
+let depthPipeline = null;
+
+const btnLoad    = document.getElementById('btnLoadModel');
+const pFill      = document.getElementById('pFill');
+const wgpuStatus = document.getElementById('wgpuStatus');
+
+// ── 加载模型 ──────────────────────────────────────────────
+//
+// pipeline() 做了什么：
+//   1. 下载 ONNX 模型文件（.onnx = 通用 AI 格式，和框架无关）
+//   2. 解析模型结构，把每个算子编译成 WebGPU Compute Shader
+//   3. 把模型权重上传到 GPU 显存 Buffer
+//
+// device 选择：
+//   webgpu：用 GPU 跑 Compute Shader，并行计算，快
+//   wasm  ：用 CPU 跑 WebAssembly，没有 GPU 加速，慢，作为 fallback
+//
+// dtype（精度）：
+//   q8 → model_q8.onnx，8位量化，~50MB，速度快，精度够用
+//   q4 → model_q4.onnx，4位量化，更小更快，精度略低
+//   fp32 → model.onnx，全精度，最大最慢
+btnLoad.addEventListener('click', async () => {
+  btnLoad.disabled = true;
+  wgpuStatus.textContent = 'loading…';
+  pFill.style.width = '0%';
+
+  try {
+    const webgpuOk = !!navigator.gpu;
+    const device   = webgpuOk ? 'webgpu' : 'wasm';
+    wgpuStatus.textContent = `device: ${device}`;
+
+    depthPipeline = await pipeline(
+      'depth-estimation',
+      'onnx-community/depth-anything-v2-small',
+      {
+        device,
+        dtype: 'q8',
+        progress_callback: (p) => {
+          if (p.status === 'downloading' && p.total) {
+            pFill.style.width = Math.round(p.loaded / p.total * 95) + '%';
+            wgpuStatus.textContent = `downloading… ${Math.round(p.loaded/p.total*100)}%`;
+          }
+        },
+      }
+    );
+
+    pFill.style.width = '100%';
+    wgpuStatus.textContent = `ready (${device})`;
+    window.__wgpu.ready = true;
+    btnLoad.textContent  = 'Reload';
+    btnLoad.disabled     = false;
+
+  } catch (e) {
+    wgpuStatus.textContent = '✗ ' + e.message;
+    btnLoad.disabled = false;
+  }
+});
+
+// ── 深度推理 ─────────────────────────────────────────────
+//
+// depthPipeline(imageSrc) 内部（以 depth-anything-v2-small 为例）：
+//   1. 解码图片 → Uint8Array [R,G,B,A, …]
+//   2. 归一化 / 标准化像素值
+//   3. 45 个 WebGPU Compute Shader 依次在 GPU 上跑（Cast→Mul→Add→Conv→...）
+//   4. 最终输出灰度深度图，通过 mapAsync 从 GPU 读回 CPU
+//   5. 返回 { depth: RawImage }，depth.data 是 Uint8Array（每像素一个亮度值）
+window.__wgpu = {
+  ready: false,
+
+  async runDepth(imageSrc) {
+    if (!depthPipeline) throw new Error('model not loaded');
+
+    const output = await depthPipeline(imageSrc);
+    const { depth } = output;
+
+    // 把 RawImage（灰度数据数组）画到 canvas，再导出为 data URL
+    const c   = document.createElement('canvas');
+    c.width   = depth.width;
+    c.height  = depth.height;
+    const ctx = c.getContext('2d');
+    const imgData = ctx.createImageData(depth.width, depth.height);
+
+    for (let i = 0; i < depth.width * depth.height; i++) {
+      const v = depth.data[i];  // 每像素一个深度值 0~255
+      imgData.data[i * 4 + 0] = v;  // R
+      imgData.data[i * 4 + 1] = v;  // G
+      imgData.data[i * 4 + 2] = v;  // B
+      imgData.data[i * 4 + 3] = 255; // A（不透明）
+    }
+    ctx.putImageData(imgData, 0, 0);
+    return c.toDataURL('image/png');
+  },
+};
 </script>
