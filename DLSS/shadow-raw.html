@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Shadow Map · 无 DLSS</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;500;600&display=swap">
+<style>
+:root{--bg:#080c12;--surf:#0f1520;--bd:#1e2d44;--fg:#c8d6e8;--muted:#5a6f8a;--red:#f87171;--amb:#fbbf24;color-scheme:dark}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--fg);font-family:'Inter',system-ui,sans-serif;font-size:14px;display:flex;flex-direction:column;align-items:center;padding:28px 16px 40px;gap:14px}
+.eyebrow{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--red)}
+h1{font-size:22px;font-weight:600;letter-spacing:-.02em}
+h1 em{font-style:normal;color:var(--red)}
+.lead{font-size:12px;color:var(--muted);max-width:560px;text-align:center;line-height:1.7}
+.wrap{position:relative;border:1px solid var(--bd);border-radius:10px;overflow:hidden}
+canvas{display:block}
+.badge{position:absolute;top:10px;left:10px;font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:600;letter-spacing:.1em;padding:4px 10px;border-radius:4px;background:rgba(248,113,113,.85);color:#000;pointer-events:none}
+.info{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)}
+.info span{color:var(--amb)}
+</style>
+</head>
+<body>
+<div class="eyebrow">WebGL2 · Shadow Map</div>
+<h1>阴影渲染 · <em>无 DLSS</em></h1>
+<p class="lead">Shadow map 分辨率 <strong style="color:var(--amb)">128 × 128</strong>，无任何超分处理。球体的阴影投影到地面，低分辨率阴影贴图产生可见的<strong style="color:var(--red)">锯齿边缘</strong>。</p>
+<div class="wrap">
+  <canvas id="c" width="560" height="420"></canvas>
+  <div class="badge">Shadow Map 128² · 无 DLSS · 单点采样</div>
+</div>
+<div class="info">阴影贴图: <span>128 × 128</span> &nbsp;·&nbsp; 滤波: NEAREST（最近邻，硬边缘）</div>
+
+<script>
+// ── 矩阵（列主序，WebGL 标准）────────────────────────────────────
+function perspective(fov, aspect, near, far) {
+  const f = 1 / Math.tan(fov / 2), m = new Float32Array(16)
+  m[0]=f/aspect; m[5]=f; m[10]=(far+near)/(near-far); m[11]=-1; m[14]=2*far*near/(near-far)
+  return m
+}
+function ortho(l, r, b, t, near, far) {
+  const m = new Float32Array(16)
+  m[0]=2/(r-l); m[5]=2/(t-b); m[10]=-2/(far-near)
+  m[12]=-(r+l)/(r-l); m[13]=-(t+b)/(t-b); m[14]=-(far+near)/(far-near); m[15]=1
+  return m
+}
+function lookAt(ex,ey,ez, cx,cy,cz) {
+  // forward = normalize(center - eye)
+  let fx=cx-ex,fy=cy-ey,fz=cz-ez
+  const fl=Math.hypot(fx,fy,fz); fx/=fl; fy/=fl; fz/=fl
+  // right = forward × worldUp(0,1,0) = (-fz, 0, fx)
+  let rx=-fz, ry=0, rz=fx
+  const rl=Math.hypot(rx,ry,rz); rx/=rl; ry/=rl; rz/=rl
+  // up = right × forward
+  const ux=ry*fz-rz*fy, uy=rz*fx-rx*fz, uz=rx*fy-ry*fx
+  const m = new Float32Array(16)
+  m[0]=rx; m[4]=ry; m[8]=rz;   m[12]=-(rx*ex+ry*ey+rz*ez)
+  m[1]=ux; m[5]=uy; m[9]=uz;   m[13]=-(ux*ex+uy*ey+uz*ez)
+  m[2]=-fx;m[6]=-fy;m[10]=-fz; m[14]=fx*ex+fy*ey+fz*ez
+  m[3]=0;  m[7]=0;  m[11]=0;   m[15]=1
+  return m
+}
+function mul(a, b) {
+  const m = new Float32Array(16)
+  for (let c=0; c<4; c++) for (let r=0; r<4; r++) {
+    let s=0; for (let k=0; k<4; k++) s += a[r+k*4] * b[k+c*4]
+    m[r+c*4] = s
+  }
+  return m
+}
+function translate(x,y,z) {
+  const m=new Float32Array(16); m[0]=m[5]=m[10]=m[15]=1; m[12]=x;m[13]=y;m[14]=z; return m
+}
+
+// ── 几何 ─────────────────────────────────────────────────────────
+// 地面：10×10 平面，法线向上
+function makePlane() {
+  const v = new Float32Array([-5,0,-5, 0,1,0,  5,0,-5, 0,1,0,  5,0,5, 0,1,0, -5,0,5, 0,1,0])
+  const i = new Uint16Array([0,2,1, 0,3,2])
+  return { v, i }
+}
+// 球：UV 球，radius=1，以 (0,0,0) 为中心
+function makeSphere(R=1, W=32, H=24) {
+  const v=[], i=[]
+  for (let p=0; p<=H; p++) {
+    const th = p*Math.PI/H
+    for (let q=0; q<=W; q++) {
+      const ph = q*2*Math.PI/W
+      const x=Math.sin(th)*Math.cos(ph), y=Math.cos(th), z=Math.sin(th)*Math.sin(ph)
+      v.push(x*R, y*R, z*R, x, y, z)   // pos(3) + normal(3)
+    }
+  }
+  for (let p=0; p<H; p++) for (let q=0; q<W; q++) {
+    const a=p*(W+1)+q, b=a+W+1
+    i.push(a,b,a+1,  b,b+1,a+1)
+  }
+  return { v: new Float32Array(v), i: new Uint32Array(i) }
+}
+
+// ── WebGL2 初始化 ─────────────────────────────────────────────────
+const canvas = document.getElementById('c')
+const gl = canvas.getContext('webgl2', { antialias: true })
+if (!gl) { alert('需要 WebGL2'); throw 0 }
+
+function compileShader(type, src) {
+  const s = gl.createShader(type)
+  gl.shaderSource(s, src); gl.compileShader(s)
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s))
+  return s
+}
+function makeProgram(vs, fs) {
+  const p = gl.createProgram()
+  gl.attachShader(p, compileShader(gl.VERTEX_SHADER, vs))
+  gl.attachShader(p, compileShader(gl.FRAGMENT_SHADER, fs))
+  gl.linkProgram(p)
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p))
+  return p
+}
+const U = (prog, name) => gl.getUniformLocation(prog, name)
+
+// ── Shaders ───────────────────────────────────────────────────────
+// Shadow pass: 把 gl_FragCoord.z (深度) 写入颜色纹理 R 通道
+// 用颜色纹理而非深度纹理，兼容性更好，也方便传给 transformers.js
+const SHADOW_VS = `#version 300 es
+in vec3 aPos;
+uniform mat4 uLightMVP;  // 光源 MVP = lightProj * lightView * model
+void main() { gl_Position = uLightMVP * vec4(aPos, 1.0); }`
+
+const SHADOW_FS = `#version 300 es
+precision highp float;
+out vec4 fragColor;
+void main() {
+  // gl_FragCoord.z 是该片元在光源裁剪空间的深度，范围 [0,1]
+  // 存入 R 通道，供主渲染的阴影测试使用
+  fragColor = vec4(gl_FragCoord.z, 0.0, 0.0, 1.0);
+}`
+
+// 主渲染 pass
+const MAIN_VS = `#version 300 es
+in vec3 aPos;
+in vec3 aNormal;
+uniform mat4 uMVP;        // 相机 MVP
+uniform mat4 uModel;      // 模型矩阵（用于法线变换）
+uniform mat4 uLightVP;    // 光源 VP（不含模型矩阵！主 shader 自己乘）
+out vec3 vNormal;
+out vec3 vWorldPos;
+out vec4 vLightSpacePos;
+void main() {
+  vec4 worldPos = uModel * vec4(aPos, 1.0);
+  gl_Position   = uMVP * worldPos;
+  vNormal       = mat3(uModel) * aNormal;
+  vWorldPos     = worldPos.xyz;
+  // 世界坐标 → 光源裁剪空间（注意：这里用 uLightVP * worldPos，不含模型矩阵）
+  vLightSpacePos = uLightVP * worldPos;
+}`
+
+const MAIN_FS = `#version 300 es
+precision highp float;
+in vec3 vNormal;
+in vec3 vWorldPos;
+in vec4 vLightSpacePos;
+uniform sampler2D uShadowMap;  // 128×128 颜色纹理，R=深度
+uniform vec3 uLightDir;
+uniform vec3 uColor;
+out vec4 fragColor;
+
+float shadowTest() {
+  // 透视除法（正交投影 w=1，但写成通用形式）
+  vec3 p = vLightSpacePos.xyz / vLightSpacePos.w;
+  // NDC [-1,1] → UV [0,1]
+  p = p * 0.5 + 0.5;
+  // 超出 shadow map 范围 = 不在阴影
+  if (p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0) return 1.0;
+  // 采样 shadow map 的 R 通道（存储的是光源视角最近深度）
+  float shadowDepth = texture(uShadowMap, p.xy).r;
+  // 当前片元深度 vs 阴影贴图深度
+  // bias=0.005 防止 shadow acne（自阴影锯齿）
+  float bias = 0.005;
+  return (p.z - bias > shadowDepth) ? 0.0 : 1.0;
+}
+
+void main() {
+  float shadow = shadowTest();
+  float NdotL  = max(dot(normalize(vNormal), normalize(uLightDir)), 0.0);
+  float ambient = 0.15;
+  float diffuse = NdotL * shadow * 0.85;
+  // 地面：棋盘格花纹（让阴影边缘更清晰可见）
+  float checker = 1.0;
+  if (abs(vNormal.y) > 0.5) {
+    vec2 g = floor(vWorldPos.xz * 1.5);
+    checker = mod(g.x + g.y, 2.0) < 1.0 ? 1.0 : 0.82;
+  }
+  fragColor = vec4(uColor * (ambient + diffuse) * checker, 1.0);
+}`
+
+const progShadow = makeProgram(SHADOW_VS, SHADOW_FS)
+const progMain   = makeProgram(MAIN_VS,   MAIN_FS)
+
+// ── VAO 工厂 ──────────────────────────────────────────────────────
+function makeVAO(geom, prog) {
+  const va = gl.createVertexArray()
+  gl.bindVertexArray(va)
+  // VBO
+  const vb = gl.createBuffer()
+  gl.bindBuffer(gl.ARRAY_BUFFER, vb)
+  gl.bufferData(gl.ARRAY_BUFFER, geom.v, gl.STATIC_DRAW)
+  // pos attribute
+  const posLoc = gl.getAttribLocation(prog, 'aPos')
+  gl.enableVertexAttribArray(posLoc)
+  gl.vertexAttribPointer(posLoc, 3, gl.FLOAT, false, 24, 0)
+  // normal attribute（如果 shader 有的话）
+  const normLoc = gl.getAttribLocation(prog, 'aNormal')
+  if (normLoc >= 0) {
+    gl.enableVertexAttribArray(normLoc)
+    gl.vertexAttribPointer(normLoc, 3, gl.FLOAT, false, 24, 12)
+  }
+  // EBO
+  const eb = gl.createBuffer()
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, eb)
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, geom.i, gl.STATIC_DRAW)
+  gl.bindVertexArray(null)
+  return { va, count: geom.i.length, isU32: geom.i instanceof Uint32Array }
+}
+
+const planeGeo  = makePlane()
+const sphereGeo = makeSphere(1.0)
+
+// Shadow pass VAO（只需 aPos，无法线）
+const shadowPlaneVAO  = makeVAO(planeGeo,  progShadow)
+const shadowSphereVAO = makeVAO(sphereGeo, progShadow)
+// Main pass VAO（需要 aPos + aNormal）
+const mainPlaneVAO    = makeVAO(planeGeo,  progMain)
+const mainSphereVAO   = makeVAO(sphereGeo, progMain)
+
+// ── Shadow Map FBO（颜色纹理存储深度）────────────────────────────
+const SHADOW_SIZE = 128
+
+const shadowColorTex = gl.createTexture()
+gl.bindTexture(gl.TEXTURE_2D, shadowColorTex)
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, SHADOW_SIZE, SHADOW_SIZE, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
+// NEAREST：保留硬边缘，使锯齿清晰可见（对比 DLSS 版本的 LINEAR）
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+
+// Depth renderbuffer（让光栅化时的深度测试正常工作）
+const shadowDepthRB = gl.createRenderbuffer()
+gl.bindRenderbuffer(gl.RENDERBUFFER, shadowDepthRB)
+gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, SHADOW_SIZE, SHADOW_SIZE)
+
+const shadowFBO = gl.createFramebuffer()
+gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFBO)
+gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, shadowColorTex, 0)
+gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, shadowDepthRB)
+const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER)
+if (status !== gl.FRAMEBUFFER_COMPLETE) console.error('Shadow FBO 不完整:', status)
+gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+
+// ── 渲染参数 ──────────────────────────────────────────────────────
+const W = 560, H = 420
+// 球体模型矩阵：中心在 (0, 1, 0)，半径 1，底部正好贴地
+const sphereModel = translate(0, 1, 0)
+// 相机：从右前上方看向原点
+const camVP = mul(perspective(Math.PI / 4, W/H, 0.1, 50), lookAt(5, 6, 8, 0, 0, 0))
+
+function drawElements(vao) {
+  gl.bindVertexArray(vao.va)
+  gl.drawElements(gl.TRIANGLES, vao.count, vao.isU32 ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT, 0)
+}
+
+let time = 0, lastTS = 0
+
+function render(ts) {
+  requestAnimationFrame(render)
+  const dt = Math.min((ts - lastTS) / 1000, 0.05)
+  lastTS = ts
+  time += dt * 0.4  // 光源旋转速度
+
+  // 光源绕 Y 轴公转，始终从上方斜射
+  const lx = Math.cos(time) * 7
+  const ly = 8
+  const lz = Math.sin(time) * 5
+  const lightVP = mul(
+    ortho(-6, 6, -6, 6, 0.5, 30),
+    lookAt(lx, ly, lz, 0, 0, 0)
+  )
+  // 光源方向（用于 diffuse 计算）
+  const ld = Math.hypot(lx, ly, lz)
+  const lightDir = [lx/ld, ly/ld, lz/ld]
+
+  // ────────────────────────────────────────────────────────────────
+  // Pass 1: Shadow pass
+  // 从光源视角渲染，把深度写入颜色纹理 R 通道
+  // ────────────────────────────────────────────────────────────────
+  gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFBO)
+  gl.viewport(0, 0, SHADOW_SIZE, SHADOW_SIZE)
+  gl.clearColor(1, 0, 0, 1)   // R=1 = 最大深度（默认背景为"无遮挡"）
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+  gl.enable(gl.DEPTH_TEST)
+  // 渲染正面（不 cull），让地面也写入深度（但地面只是接收阴影，不遮挡球）
+  gl.disable(gl.CULL_FACE)
+
+  gl.useProgram(progShadow)
+
+  // 地面 shadow pass：lightMVP = lightVP * identity
+  gl.uniformMatrix4fv(U(progShadow, 'uLightMVP'), false, lightVP)
+  drawElements(shadowPlaneVAO)
+
+  // 球 shadow pass：lightMVP = lightVP * sphereModel
+  gl.uniformMatrix4fv(U(progShadow, 'uLightMVP'), false, mul(lightVP, sphereModel))
+  drawElements(shadowSphereVAO)
+
+  // ────────────────────────────────────────────────────────────────
+  // Pass 2: 主渲染 pass
+  // 使用 shadow map 做阴影测试，渲染带光照的场景
+  // ────────────────────────────────────────────────────────────────
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+  gl.viewport(0, 0, W, H)
+  gl.clearColor(0.05, 0.08, 0.14, 1)
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+  gl.enable(gl.DEPTH_TEST)
+  gl.enable(gl.CULL_FACE)
+  gl.cullFace(gl.BACK)
+
+  gl.useProgram(progMain)
+  gl.uniform3fv(U(progMain, 'uLightDir'), lightDir)
+  // 绑定 shadow map 纹理到 unit 0
+  gl.activeTexture(gl.TEXTURE0)
+  gl.bindTexture(gl.TEXTURE_2D, shadowColorTex)
+  gl.uniform1i(U(progMain, 'uShadowMap'), 0)
+
+  // 地面：model = identity
+  gl.uniformMatrix4fv(U(progMain, 'uMVP'),      false, camVP)
+  gl.uniformMatrix4fv(U(progMain, 'uModel'),     false, new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]))
+  // uLightVP：只传 VP，不含模型矩阵（shader 里会乘以 worldPos）
+  gl.uniformMatrix4fv(U(progMain, 'uLightVP'),   false, lightVP)
+  gl.uniform3f(U(progMain, 'uColor'), 0.55, 0.58, 0.65)
+  drawElements(mainPlaneVAO)
+
+  // 球体：model = sphereModel，但 uLightVP 仍然只传 lightVP
+  gl.uniformMatrix4fv(U(progMain, 'uMVP'),      false, mul(camVP, sphereModel))
+  gl.uniformMatrix4fv(U(progMain, 'uModel'),     false, sphereModel)
+  gl.uniformMatrix4fv(U(progMain, 'uLightVP'),   false, lightVP)  // 关键：不含模型矩阵
+  gl.uniform3f(U(progMain, 'uColor'), 0.55, 0.70, 0.95)
+  drawElements(mainSphereVAO)
+}
+
+requestAnimationFrame(render)
+</script>
+</body>
+</html>

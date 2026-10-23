@@ -1,0 +1,685 @@
+<title>DLSS 超分辨率</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;500;600&display=swap">
+
+<style>
+/* ── Token system ──────────────────────────────────────── */
+/* Layout: split-panel comparison + sidebar stats on wide, stacked on narrow */
+:root {
+  --bg: #f0f2f5;
+  --surf: #ffffff;
+  --surf2: #f7f8fa;
+  --border: #e2e6ec;
+  --fg: #0d1117;
+  --muted: #6e7a8a;
+  --accent: #1a6cf5;
+  --accent-dim: #dce8ff;
+  --green: #12a05c;
+  --amber: #d97706;
+  --red: #dc2626;
+  --purple: #7c3aed;
+  --mono: 'JetBrains Mono', 'Cascadia Code', monospace;
+  --sans: 'Inter', system-ui, sans-serif;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #080c12;
+    --surf: #0f1520;
+    --surf2: #151d2e;
+    --border: #1e2d44;
+    --fg: #c8d6e8;
+    --muted: #5a6f8a;
+    --accent: #38bdf8;
+    --accent-dim: #0d2035;
+    --green: #4ade80;
+    --amber: #fbbf24;
+    --red: #f87171;
+    --purple: #a78bfa;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #080c12;
+  --surf: #0f1520;
+  --surf2: #151d2e;
+  --border: #1e2d44;
+  --fg: #c8d6e8;
+  --muted: #5a6f8a;
+  --accent: #38bdf8;
+  --accent-dim: #0d2035;
+  --green: #4ade80;
+  --amber: #fbbf24;
+  --red: #f87171;
+  --purple: #a78bfa;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.6;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 32px 48px;
+}
+
+/* ── Header ───────────────────────────────────────────── */
+.header { margin-bottom: 28px; }
+.eyebrow {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 8px;
+}
+h1 {
+  font-size: clamp(20px, 4vw, 32px);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  margin-bottom: 8px;
+}
+h1 em { font-style: normal; color: var(--accent); }
+.lead {
+  font-size: 14px;
+  color: var(--muted);
+  max-width: 560px;
+  line-height: 1.7;
+}
+
+/* ── Layout ───────────────────────────────────────────── */
+.workspace {
+  display: grid;
+  grid-template-columns: 1fr 260px;
+  gap: 20px;
+  align-items: start;
+}
+@media (max-width: 700px) {
+  .workspace { grid-template-columns: 1fr; }
+}
+
+/* ── Card ─────────────────────────────────────────────── */
+.card {
+  background: var(--surf);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+}
+
+/* ── Upload zone ──────────────────────────────────────── */
+.upload-zone {
+  border: 2px dashed var(--border);
+  border-radius: 10px;
+  padding: 32px 20px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+  background: var(--surf2);
+  position: relative;
+}
+.upload-zone:hover, .upload-zone.drag { border-color: var(--accent); background: var(--accent-dim); }
+.upload-zone input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; }
+.upload-icon {
+  width: 40px; height: 40px;
+  margin: 0 auto 12px;
+  border-radius: 10px;
+  background: var(--accent-dim);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--accent);
+}
+.upload-icon svg { width: 20px; height: 20px; }
+.upload-label { font-size: 14px; font-weight: 500; margin-bottom: 4px; }
+.upload-sub { font-size: 12px; color: var(--muted); }
+
+/* ── Compare panel ────────────────────────────────────── */
+.compare-wrap {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 4/3;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #000;
+  user-select: none;
+  cursor: col-resize;
+  display: none;
+}
+.compare-wrap.visible { display: block; }
+.compare-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+#imgHR { z-index: 1; }
+#imgLR { z-index: 2; clip-path: inset(0 50% 0 0); }
+.divider {
+  position: absolute;
+  top: 0; bottom: 0;
+  left: 50%;
+  width: 2px;
+  background: #fff;
+  z-index: 10;
+  transform: translateX(-50%);
+  box-shadow: 0 0 8px rgba(0,0,0,.5);
+}
+.divider-handle {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%,-50%);
+  width: 32px; height: 32px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 2px 8px rgba(0,0,0,.4);
+  display: flex; align-items: center; justify-content: center;
+  color: #111;
+}
+.divider-handle svg { width: 16px; height: 16px; }
+.panel-label {
+  position: absolute;
+  bottom: 10px;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  padding: 4px 8px;
+  border-radius: 4px;
+  z-index: 20;
+  pointer-events: none;
+}
+.label-lr { left: 10px; background: rgba(0,0,0,.6); color: #fff; }
+.label-hr { right: 10px; background: rgba(56,189,248,.9); color: #000; }
+
+/* ── Action row ───────────────────────────────────────── */
+.action-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 14px;
+}
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 18px;
+  border-radius: 7px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  border: none;
+  font-family: var(--sans);
+  transition: opacity 0.15s, transform 0.1s;
+}
+.btn:active { transform: scale(0.97); }
+.btn-primary { background: var(--accent); color: #fff; }
+.btn-primary:hover { opacity: 0.85; }
+.btn-primary:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
+.btn-ghost {
+  background: var(--surf2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+}
+.btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ── Status ───────────────────────────────────────────── */
+.status {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  display: none;
+}
+.status.visible { display: inline-flex; align-items: center; gap: 6px; }
+.status-running { background: var(--accent-dim); color: var(--accent); }
+.status-ok { background: rgba(74,222,128,.12); color: var(--green); }
+.status-err { background: rgba(248,113,113,.12); color: var(--red); }
+.spinner {
+  width: 12px; height: 12px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Sidebar ──────────────────────────────────────────── */
+.sidebar { display: flex; flex-direction: column; gap: 16px; }
+.sidebar-section { }
+.sidebar-title {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.stat-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 0;
+  font-size: 13px;
+}
+.stat-label { color: var(--muted); }
+.stat-val {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}
+.stat-val.accent { color: var(--accent); }
+.stat-val.green { color: var(--green); }
+
+/* ── Architecture diagram ─────────────────────────────── */
+.arch-diagram {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-family: var(--mono);
+  font-size: 10px;
+}
+.arch-block {
+  padding: 6px 10px;
+  border-radius: 5px;
+  border-left: 3px solid transparent;
+  line-height: 1.4;
+}
+.arch-block.input  { border-color: var(--muted); background: var(--surf2); }
+.arch-block.feat   { border-color: var(--amber); background: rgba(217,119,6,.08); }
+.arch-block.attn   { border-color: var(--purple); background: rgba(124,58,237,.08); }
+.arch-block.upsamp { border-color: var(--green); background: rgba(18,160,92,.08); }
+.arch-block.output { border-color: var(--accent); background: var(--accent-dim); }
+.arch-arrow {
+  text-align: center;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1;
+}
+.arch-label { font-weight: 600; color: var(--fg); }
+.arch-sub { color: var(--muted); font-size: 9px; }
+
+/* ── Server status indicator ──────────────────────────── */
+.server-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+  display: inline-block;
+  transition: background 0.3s;
+}
+.server-dot.online { background: var(--green); box-shadow: 0 0 4px var(--green); }
+.server-dot.offline { background: var(--red); }
+.server-line { display: flex; align-items: center; gap: 7px; font-size: 12px; }
+
+/* ── Download row ─────────────────────────────────────── */
+#downloadRow { display: none; }
+#downloadRow.visible { display: flex; }
+
+/* ── Scale slider ─────────────────────────────────────── */
+.slider-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.slider-label span:last-child { font-family: var(--mono); color: var(--fg); font-weight: 600; }
+input[type=range] {
+  width: 100%;
+  accent-color: var(--accent);
+}
+</style>
+
+<div class="header">
+  <div class="eyebrow">Neural Network · Super Resolution</div>
+  <h1>DLSS 风格 <em>超分辨率</em></h1>
+  <p class="lead">上传低分辨率图片，Swin2SR Transformer 神经网络将其放大 4×，重建高频细节——而非插值。</p>
+</div>
+
+<div class="workspace">
+  <!-- Main panel -->
+  <div>
+    <div class="card" style="margin-bottom:16px">
+      <!-- Upload -->
+      <div id="uploadZone" class="upload-zone">
+        <input type="file" id="fileInput" accept="image/*">
+        <div class="upload-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+        </div>
+        <div class="upload-label">拖入图片或点击选择</div>
+        <div class="upload-sub">支持 JPEG / PNG / WebP · 建议 128–512px</div>
+      </div>
+
+      <!-- Before/after compare -->
+      <div id="compareWrap" class="compare-wrap" style="margin-top:16px">
+        <img id="imgHR" class="compare-img" src="" alt="高分辨率结果">
+        <img id="imgLR" class="compare-img" src="" alt="低分辨率输入">
+        <div id="divider" class="divider">
+          <div class="divider-handle">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+              <line x1="8" y1="12" x2="16" y2="12"/>
+              <polyline points="5 9 2 12 5 15"/>
+              <polyline points="19 9 22 12 19 15"/>
+            </svg>
+          </div>
+        </div>
+        <span class="panel-label label-lr">原始</span>
+        <span class="panel-label label-hr">Swin2SR ×4</span>
+      </div>
+
+      <!-- Action row -->
+      <div class="action-row">
+        <button id="runBtn" class="btn btn-primary" disabled>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+            <polygon points="5 3 19 12 5 21 5 3"/>
+          </svg>
+          运行超分
+        </button>
+        <div id="statusEl" class="status"></div>
+      </div>
+
+      <!-- Download -->
+      <div id="downloadRow" class="action-row" style="margin-top:10px">
+        <button id="downloadBtn" class="btn btn-ghost">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+          保存高分辨率图
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <!-- Server status -->
+    <div class="card">
+      <div class="sidebar-title">服务器状态</div>
+      <div class="server-line">
+        <span id="serverDot" class="server-dot"></span>
+        <span id="serverStatus" style="color:var(--muted)">检查中…</span>
+      </div>
+      <div style="margin-top:8px;font-size:11px;color:var(--muted);font-family:var(--mono)">localhost:8001</div>
+    </div>
+
+    <!-- Run stats -->
+    <div class="card">
+      <div class="sidebar-title">推理统计</div>
+      <div class="stat-row">
+        <span class="stat-label">输入尺寸</span>
+        <span id="statIn" class="stat-val">—</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">输出尺寸</span>
+        <span id="statOut" class="stat-val accent">—</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">推理耗时</span>
+        <span id="statTime" class="stat-val green">—</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">放大倍数</span>
+        <span class="stat-val">×4</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">设备</span>
+        <span id="statDevice" class="stat-val">—</span>
+      </div>
+    </div>
+
+    <!-- Architecture -->
+    <div class="card">
+      <div class="sidebar-title">网络架构 · Swin2SR</div>
+      <div class="arch-diagram">
+        <div class="arch-block input">
+          <div class="arch-label">低分辨率输入</div>
+          <div class="arch-sub">H × W × 3</div>
+        </div>
+        <div class="arch-arrow">↓</div>
+        <div class="arch-block feat">
+          <div class="arch-label">浅层特征提取</div>
+          <div class="arch-sub">3×3 Conv → C=180</div>
+        </div>
+        <div class="arch-arrow">↓ × 6</div>
+        <div class="arch-block attn">
+          <div class="arch-label">RSTB 残差块</div>
+          <div class="arch-sub">6 × Swin-Transformer<br>W-MSA + SW-MSA 注意力</div>
+        </div>
+        <div class="arch-arrow">↓</div>
+        <div class="arch-block upsamp">
+          <div class="arch-label">PixelShuffle ×4</div>
+          <div class="arch-sub">亚像素卷积上采样</div>
+        </div>
+        <div class="arch-arrow">↓</div>
+        <div class="arch-block output">
+          <div class="arch-label">高分辨率输出</div>
+          <div class="arch-sub">4H × 4W × 3</div>
+        </div>
+      </div>
+      <div style="margin-top:12px;font-size:11px;color:var(--muted);line-height:1.6">
+        参数量约 <strong style="color:var(--fg)">11.7M</strong>，训练数据 DIV2K+Flickr2K，损失函数 L1。
+      </div>
+    </div>
+
+    <!-- DLSS comparison -->
+    <div class="card">
+      <div class="sidebar-title">与 DLSS 对比</div>
+      <div style="font-size:12px;line-height:1.8;color:var(--muted)">
+        <div style="margin-bottom:6px;color:var(--fg);font-weight:500">Swin2SR（本实现）</div>
+        纯空域 Transformer<br>
+        单帧推理，无需运动向量<br>
+        开源可本地运行<br>
+        Apple MPS / CUDA 加速
+      </div>
+      <div style="margin-top:12px;font-size:12px;line-height:1.8;color:var(--muted)">
+        <div style="margin-bottom:6px;color:var(--fg);font-weight:500">DLSS（NVIDIA 专有）</div>
+        CNN + 时域累积（TAA）<br>
+        需要运动向量 + Tensor Core<br>
+        多帧超分，处理运动模糊<br>
+        锁定 RTX 显卡
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const SERVER = 'http://localhost:8001'
+
+// ── Elements ──────────────────────────────────────────────────
+const fileInput   = document.getElementById('fileInput')
+const uploadZone  = document.getElementById('uploadZone')
+const compareWrap = document.getElementById('compareWrap')
+const imgLR       = document.getElementById('imgLR')
+const imgHR       = document.getElementById('imgHR')
+const divider     = document.getElementById('divider')
+const runBtn      = document.getElementById('runBtn')
+const statusEl    = document.getElementById('statusEl')
+const downloadRow = document.getElementById('downloadRow')
+const downloadBtn = document.getElementById('downloadBtn')
+const serverDot   = document.getElementById('serverDot')
+const serverStatus= document.getElementById('serverStatus')
+const statIn      = document.getElementById('statIn')
+const statOut     = document.getElementById('statOut')
+const statTime    = document.getElementById('statTime')
+const statDevice  = document.getElementById('statDevice')
+
+let lrObjectURL = null
+let hrObjectURL = null
+let hrBlob      = null
+
+// ── Server health check ────────────────────────────────────────
+async function checkServer() {
+  try {
+    const r = await fetch(SERVER + '/', { signal: AbortSignal.timeout(3000) })
+    if (r.ok) {
+      const data = await r.json()
+      serverDot.className = 'server-dot online'
+      serverStatus.textContent = 'Swin2SR 已就绪'
+      serverStatus.style.color = 'var(--green)'
+      statDevice.textContent = data.device ?? '—'
+    } else throw new Error()
+  } catch {
+    serverDot.className = 'server-dot offline'
+    serverStatus.textContent = '未连接'
+    serverStatus.style.color = 'var(--red)'
+  }
+}
+checkServer()
+setInterval(checkServer, 8000)
+
+// ── File input ─────────────────────────────────────────────────
+fileInput.addEventListener('change', e => {
+  const file = e.target.files[0]
+  if (file) loadImage(file)
+})
+
+uploadZone.addEventListener('dragover', e => {
+  e.preventDefault()
+  uploadZone.classList.add('drag')
+})
+uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag'))
+uploadZone.addEventListener('drop', e => {
+  e.preventDefault()
+  uploadZone.classList.remove('drag')
+  const file = e.dataTransfer.files[0]
+  if (file && file.type.startsWith('image/')) loadImage(file)
+})
+
+function loadImage(file) {
+  if (lrObjectURL) URL.revokeObjectURL(lrObjectURL)
+  if (hrObjectURL) URL.revokeObjectURL(hrObjectURL)
+  hrBlob = null
+  downloadRow.classList.remove('visible')
+  imgHR.src = ''
+
+  lrObjectURL = URL.createObjectURL(file)
+  imgLR.src = lrObjectURL
+  imgHR.src = lrObjectURL    // placeholder until SR runs
+
+  compareWrap.classList.add('visible')
+  setDividerPos(50)
+
+  // reset stats
+  statIn.textContent = '—'
+  statOut.textContent = '—'
+  statTime.textContent = '—'
+
+  runBtn.disabled = false
+  runBtn._file = file
+  setStatus('')
+}
+
+// ── Run super-resolution ────────────────────────────────────────
+runBtn.addEventListener('click', async () => {
+  const file = runBtn._file
+  if (!file) return
+
+  runBtn.disabled = true
+  setStatus('running', '神经网络推理中…')
+
+  try {
+    const form = new FormData()
+    form.append('file', file)
+
+    const t0 = Date.now()
+    const res = await fetch(SERVER + '/superres', { method: 'POST', body: form })
+
+    if (!res.ok) {
+      const err = await res.text()
+      throw new Error(err || `HTTP ${res.status}`)
+    }
+
+    hrBlob = await res.blob()
+
+    // Read response headers for stats
+    const inSize  = res.headers.get('X-Input-Size')  ?? '—'
+    const outSize = res.headers.get('X-Output-Size') ?? '—'
+    const elapsed = res.headers.get('X-Inference-Time') ?? `${((Date.now()-t0)/1000).toFixed(2)}s`
+
+    statIn.textContent   = inSize
+    statOut.textContent  = outSize
+    statTime.textContent = elapsed
+
+    if (hrObjectURL) URL.revokeObjectURL(hrObjectURL)
+    hrObjectURL = URL.createObjectURL(hrBlob)
+    imgHR.src = hrObjectURL
+
+    setStatus('ok', `完成 · ${elapsed}`)
+    downloadRow.classList.add('visible')
+  } catch (err) {
+    setStatus('err', '错误：' + err.message)
+  }
+
+  runBtn.disabled = false
+})
+
+// ── Download ────────────────────────────────────────────────────
+downloadBtn.addEventListener('click', () => {
+  if (!hrBlob) return
+  // Use clipboard as primary, then create a temporary anchor
+  const a = document.createElement('a')
+  a.href = hrObjectURL
+  a.download = 'superres_x4.png'
+  // Trigger click programmatically — works in browsers within artifact
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+})
+
+// ── Compare divider drag ────────────────────────────────────────
+let dragging = false
+
+compareWrap.addEventListener('mousedown', e => {
+  dragging = true
+  e.preventDefault()
+})
+compareWrap.addEventListener('touchstart', e => {
+  dragging = true
+}, { passive: true })
+
+document.addEventListener('mousemove', e => {
+  if (!dragging) return
+  const rect = compareWrap.getBoundingClientRect()
+  const pct = Math.max(0, Math.min(100, (e.clientX - rect.left) / rect.width * 100))
+  setDividerPos(pct)
+})
+document.addEventListener('touchmove', e => {
+  if (!dragging) return
+  const rect = compareWrap.getBoundingClientRect()
+  const pct = Math.max(0, Math.min(100, (e.touches[0].clientX - rect.left) / rect.width * 100))
+  setDividerPos(pct)
+}, { passive: true })
+document.addEventListener('mouseup',  () => { dragging = false })
+document.addEventListener('touchend', () => { dragging = false })
+
+function setDividerPos(pct) {
+  divider.style.left = pct + '%'
+  imgLR.style.clipPath = `inset(0 ${100 - pct}% 0 0)`
+}
+
+// ── Status helpers ─────────────────────────────────────────────
+function setStatus(type, msg) {
+  if (!type) { statusEl.className = 'status'; return }
+  const map = { running: 'status-running', ok: 'status-ok', err: 'status-err' }
+  statusEl.className = `status visible ${map[type]}`
+  statusEl.innerHTML = type === 'running'
+    ? `<span class="spinner"></span>${msg}`
+    : msg
+}
+</script>

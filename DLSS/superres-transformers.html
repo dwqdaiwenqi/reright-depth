@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DLSS 超分 · Transformers.js</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;500;600&display=swap">
+<style>
+:root {
+  --bg:    #080c12;
+  --surf:  #0f1520;
+  --surf2: #151d2e;
+  --bd:    #1e2d44;
+  --fg:    #c8d6e8;
+  --muted: #5a6f8a;
+  --acc:   #38bdf8;
+  --adim:  #0d2035;
+  --grn:   #4ade80;
+  --amb:   #fbbf24;
+  --red:   #f87171;
+  --pur:   #a78bfa;
+  --mono:  'JetBrains Mono', monospace;
+  --sans:  'Inter', system-ui, sans-serif;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg); color: var(--fg);
+  font-family: var(--sans); font-size: 14px; line-height: 1.6;
+  padding: 28px 24px 48px;
+}
+
+/* ── header ── */
+.eyebrow { font-family: var(--mono); font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: var(--acc); margin-bottom: 8px; }
+h1 { font-size: clamp(18px,3.5vw,28px); font-weight: 600; letter-spacing: -.02em; margin-bottom: 6px; }
+h1 em { font-style: normal; color: var(--acc); }
+.lead { font-size: 13px; color: var(--muted); margin-bottom: 24px; max-width: 580px; }
+
+/* ── layout ── */
+.grid { display: grid; grid-template-columns: 1fr 230px; gap: 16px; align-items: start; }
+@media (max-width: 660px) { .grid { grid-template-columns: 1fr; } }
+
+/* ── card ── */
+.card { background: var(--surf); border: 1px solid var(--bd); border-radius: 12px; padding: 18px; margin-bottom: 14px; }
+.ctitle { font-family: var(--mono); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid var(--bd); }
+
+/* ── model loader ── */
+.model-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--mono); font-size: 10px; font-weight: 600;
+  padding: 3px 10px; border-radius: 20px; border: 1px solid;
+}
+.badge-webgpu { border-color: var(--acc); color: var(--acc); background: var(--adim); }
+.badge-wasm   { border-color: var(--amb); color: var(--amb); background: rgba(251,191,36,.08); }
+.badge-dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; box-shadow: 0 0 4px currentColor; }
+
+/* ── progress ── */
+.prog { height: 3px; background: var(--bd); border-radius: 2px; margin-top: 10px; overflow: hidden; display: none; }
+.prog.show { display: block; }
+.prog-fill { height: 100%; background: var(--acc); border-radius: 2px; width: 0; transition: width .25s; }
+.prog-label { font-family: var(--mono); font-size: 10px; color: var(--muted); margin-top: 5px; display: none; }
+.prog-label.show { display: block; }
+
+/* ── drop zone ── */
+.drop {
+  border: 2px dashed var(--bd); border-radius: 8px; padding: 28px 16px;
+  text-align: center; cursor: pointer; position: relative;
+  transition: border-color .15s, background .15s; background: var(--surf2);
+}
+.drop:hover, .drop.drag { border-color: var(--acc); background: var(--adim); }
+.drop input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; }
+.drop-icon { font-size: 26px; margin-bottom: 8px; }
+.drop-main { font-size: 13px; font-weight: 500; }
+.drop-sub  { font-size: 11px; color: var(--muted); margin-top: 3px; }
+
+/* ── compare ── */
+.cmp {
+  position: relative; width: 100%; aspect-ratio: 1;
+  border-radius: 8px; overflow: hidden; background: #000;
+  cursor: col-resize; user-select: none; display: none; margin-top: 14px;
+}
+.cmp.show { display: block; }
+.cimg { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+#imgHR { z-index: 1; }
+#imgLR { z-index: 2; clip-path: inset(0 50% 0 0); }
+.div-line {
+  position: absolute; top: 0; bottom: 0; left: 50%; width: 2px;
+  background: #fff; z-index: 10; transform: translateX(-50%);
+  box-shadow: 0 0 6px rgba(0,0,0,.7);
+}
+.div-knob {
+  position: absolute; top: 50%; left: 50%;
+  transform: translate(-50%,-50%);
+  width: 28px; height: 28px; border-radius: 50%;
+  background: #fff; display: flex; align-items: center; justify-content: center;
+  font-size: 12px; color: #111; box-shadow: 0 1px 6px rgba(0,0,0,.5);
+}
+.plbl {
+  position: absolute; bottom: 8px; z-index: 20; pointer-events: none;
+  font-family: var(--mono); font-size: 9px; font-weight: 600;
+  letter-spacing: .08em; padding: 3px 7px; border-radius: 4px;
+}
+.plbl-l { left: 8px; background: rgba(0,0,0,.65); color: #fff; }
+.plbl-r { right: 8px; background: rgba(56,189,248,.85); color: #000; }
+
+/* ── buttons ── */
+.brow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+.btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 7px 16px; border-radius: 6px; border: none;
+  font-size: 13px; font-weight: 600; cursor: pointer; font-family: var(--sans);
+  transition: opacity .15s, transform .1s;
+}
+.btn:active { transform: scale(.97); }
+.btn-p { background: var(--acc); color: #000; }
+.btn-p:hover { opacity: .85; }
+.btn-p:disabled { opacity: .35; cursor: not-allowed; transform: none; }
+.btn-g { background: var(--surf2); color: var(--fg); border: 1px solid var(--bd); }
+.btn-g:hover { border-color: var(--acc); color: var(--acc); }
+
+/* ── status ── */
+.sts {
+  font-family: var(--mono); font-size: 11px;
+  padding: 5px 10px; border-radius: 5px;
+  display: none; align-items: center; gap: 6px;
+}
+.sts.show { display: inline-flex; }
+.sts-load { background: rgba(56,189,248,.1); color: var(--acc); }
+.sts-run  { background: rgba(251,191,36,.1);  color: var(--amb); }
+.sts-ok   { background: rgba(74,222,128,.1);  color: var(--grn); }
+.sts-err  { background: rgba(248,113,113,.1); color: var(--red); }
+.spin { width: 10px; height: 10px; border: 1.5px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin .7s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── sidebar stats ── */
+.srow { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; padding: 4px 0; font-size: 12px; border-bottom: 1px solid var(--bd); }
+.srow:last-child { border: none; }
+.slbl { color: var(--muted); }
+.sval { font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--fg); font-variant-numeric: tabular-nums; }
+.sval.ca { color: var(--acc); }
+.sval.cg { color: var(--grn); }
+.sval.cp { color: var(--pur); }
+
+/* ── log ── */
+.log {
+  font-family: var(--mono); font-size: 10px; line-height: 1.9;
+  color: var(--muted); background: var(--surf2);
+  border: 1px solid var(--bd); border-radius: 6px;
+  padding: 10px 12px; max-height: 140px; overflow-y: auto;
+}
+.lok { color: var(--grn); }
+.lwarn { color: var(--amb); }
+.lerr { color: var(--red); }
+</style>
+</head>
+<body>
+
+<div class="eyebrow">Transformers.js · WebGPU · 纯浏览器推理</div>
+<h1>DLSS 超分辨率 <em>× Transformers.js</em></h1>
+<p class="lead">
+  Swin2SR 模型直接在浏览器里跑。Transformers.js 封装了 ONNX Runtime Web，
+  模型从 HuggingFace Hub 自动下载并缓存，后续刷新秒加载，不需要 Python 服务器。
+</p>
+
+<div class="grid">
+  <!-- 主面板 -->
+  <div>
+    <!-- 模型加载 -->
+    <div class="card">
+      <div class="ctitle">模型加载</div>
+      <div class="model-row">
+        <span id="epBadge" class="badge badge-wasm"><span class="badge-dot"></span>检测 WebGPU…</span>
+        <button id="loadBtn" class="btn btn-p">⬇ 加载 Swin2SR 模型</button>
+        <div id="loadSts" class="sts"></div>
+      </div>
+      <div id="loadProg" class="prog"><div id="loadFill" class="prog-fill"></div></div>
+      <div id="loadLabel" class="prog-label"></div>
+    </div>
+
+    <!-- 图片 -->
+    <div class="card">
+      <div class="ctitle">上传图片</div>
+      <div id="drop" class="drop">
+        <input type="file" id="imgInput" accept="image/*">
+        <div class="drop-icon">🖼</div>
+        <div class="drop-main">拖入图片或点击选择</div>
+        <div class="drop-sub">建议 64–512px · 输入自动填充到 64 的倍数</div>
+      </div>
+
+      <!-- 对比视图 -->
+      <div id="cmp" class="cmp">
+        <img id="imgHR" class="cimg" src="" alt="超分结果">
+        <img id="imgLR" class="cimg" src="" alt="原图">
+        <div id="divLine" class="div-line">
+          <div class="div-knob">↔</div>
+        </div>
+        <span class="plbl plbl-l">原始</span>
+        <span class="plbl plbl-r">Swin2SR ×4</span>
+      </div>
+
+      <div class="brow">
+        <button id="runBtn" class="btn btn-p" disabled>▶ 运行超分</button>
+        <div id="runSts" class="sts"></div>
+      </div>
+      <div id="runProg" class="prog"><div id="runFill" class="prog-fill"></div></div>
+
+      <div class="brow" id="dlRow" style="display:none;margin-top:10px">
+        <button id="dlBtn" class="btn btn-g">💾 保存高分辨率图</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 侧边栏 -->
+  <div>
+    <div class="card">
+      <div class="ctitle">推理统计</div>
+      <div class="srow"><span class="slbl">执行器</span><span id="sEP"   class="sval cp">—</span></div>
+      <div class="srow"><span class="slbl">模型</span>  <span         class="sval">Swin2SR ×4</span></div>
+      <div class="srow"><span class="slbl">输入</span>  <span id="sIn"   class="sval">—</span></div>
+      <div class="srow"><span class="slbl">输出</span>  <span id="sOut"  class="sval ca">—</span></div>
+      <div class="srow"><span class="slbl">模型下载</span><span id="sDl"  class="sval">—</span></div>
+      <div class="srow"><span class="slbl">推理耗时</span><span id="sInf" class="sval cg">—</span></div>
+    </div>
+
+    <div class="card">
+      <div class="ctitle">运行日志</div>
+      <div class="log" id="logEl"></div>
+    </div>
+
+    <div class="card" style="font-size:12px;color:var(--muted);line-height:1.8">
+      <div class="ctitle">工作原理</div>
+      <code style="color:var(--acc)">pipeline('image-to-image')</code><br>
+      → 从 HF Hub 下载 ONNX 权重<br>
+      → ort.InferenceSession (WebGPU)<br>
+      → RawImage 预处理<br>
+      → Swin2SR 前向传播<br>
+      → 结果写入 Canvas
+    </div>
+  </div>
+</div>
+
+<script type="module">
+// ── Transformers.js v3 ────────────────────────────────────────────────────────
+import {
+  pipeline,
+  env,
+  RawImage,
+} from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.3/dist/transformers.min.js'
+
+// 模型 ID（HuggingFace Hub 上的 ONNX 版本）
+// Xenova 命名空间是官方 transformers.js 转换版本
+const MODEL_ID = 'Xenova/swin2SR-classical-sr-x4-64'
+
+// ── DOM refs ─────────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id)
+const epBadge  = $('epBadge')
+const loadBtn  = $('loadBtn')
+const loadSts  = $('loadSts')
+const loadProg = $('loadProg')
+const loadFill = $('loadFill')
+const loadLabel= $('loadLabel')
+const drop     = $('drop')
+const imgInput = $('imgInput')
+const cmp      = $('cmp')
+const imgLR    = $('imgLR')
+const imgHR    = $('imgHR')
+const divLine  = $('divLine')
+const runBtn   = $('runBtn')
+const runSts   = $('runSts')
+const runProg  = $('runProg')
+const runFill  = $('runFill')
+const dlRow    = $('dlRow')
+const dlBtn    = $('dlBtn')
+const logEl    = $('logEl')
+
+let pipe     = null
+let lrURL    = null
+let hrURL    = null
+let hrCanvas = null
+let device   = 'wasm'
+
+// ── 日志 ─────────────────────────────────────────────────────────────────────
+function log(msg, cls = '') {
+  const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false })
+  const d  = document.createElement('div')
+  if (cls) d.className = cls
+  d.textContent = `[${ts}] ${msg}`
+  logEl.appendChild(d)
+  logEl.scrollTop = logEl.scrollHeight
+}
+
+// ── WebGPU 检测 ───────────────────────────────────────────────────────────────
+if (navigator.gpu) {
+  const adapter = await navigator.gpu.requestAdapter()
+  if (adapter) {
+    device = 'webgpu'
+    const info = adapter.info?.description ?? adapter.info?.device ?? 'GPU'
+    epBadge.className  = 'badge badge-webgpu'
+    epBadge.innerHTML  = '<span class="badge-dot"></span>WebGPU · ' + info
+    $('sEP').textContent = 'webgpu'
+    log('WebGPU 可用：' + info, 'lok')
+  }
+} else {
+  epBadge.textContent = '⚠ 无 WebGPU，回退 WASM'
+  $('sEP').textContent = 'wasm'
+  log('WebGPU 不可用，使用 WASM（推理较慢）', 'lwarn')
+}
+
+// ── 状态 helper ───────────────────────────────────────────────────────────────
+function setSts(el, type, msg) {
+  const map = { load: 'sts-load', run: 'sts-run', ok: 'sts-ok', err: 'sts-err' }
+  el.className = 'sts show ' + (map[type] ?? '')
+  el.innerHTML = (type === 'load' || type === 'run')
+    ? `<span class="spin"></span>${msg}`
+    : msg
+}
+function clrSts(el) { el.className = 'sts' }
+function setProg(prog, fill, pct) { prog.className = 'prog show'; fill.style.width = pct + '%' }
+function clrProg(prog) { prog.className = 'prog' }
+
+// ── 加载模型 ──────────────────────────────────────────────────────────────────
+loadBtn.addEventListener('click', async () => {
+  loadBtn.disabled = true
+  setSts(loadSts, 'load', '连接 HuggingFace Hub…')
+  setProg(loadProg, loadFill, 2)
+  loadLabel.className = 'prog-label show'
+  log(`加载模型 ${MODEL_ID}（首次需要下载 ~60MB）`)
+
+  const t0 = Date.now()
+
+  try {
+    pipe = await pipeline('image-to-image', MODEL_ID, {
+      device,
+      // 下载进度回调
+      progress_callback(info) {
+        if (info.status === 'downloading') {
+          const pct = info.total ? Math.round(info.loaded / info.total * 90) : 0
+          setProg(loadProg, loadFill, pct)
+          const mb = (info.loaded / 1024 / 1024).toFixed(1)
+          const tot= info.total ? (info.total / 1024 / 1024).toFixed(1) : '?'
+          loadLabel.textContent = `${info.file ?? '权重'} · ${mb} / ${tot} MB`
+          if (pct % 10 === 0) log(`下载中：${mb} / ${tot} MB`)
+        } else if (info.status === 'initiate') {
+          log(`初始化：${info.file ?? ''}`)
+        } else if (info.status === 'done') {
+          log(`完成：${info.file ?? ''}`, 'lok')
+        }
+      },
+    })
+
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1)
+    $('sDl').textContent = elapsed + 's'
+    setProg(loadProg, loadFill, 100)
+    setTimeout(() => { clrProg(loadProg); loadLabel.className = 'prog-label' }, 600)
+
+    setSts(loadSts, 'ok', `✓ 就绪（${elapsed}s）`)
+    log(`模型加载完成，耗时 ${elapsed}s`, 'lok')
+
+    if (lrURL) runBtn.disabled = false
+
+  } catch (e) {
+    setSts(loadSts, 'err', '加载失败：' + e.message)
+    log('加载失败：' + e.message, 'lerr')
+    console.error(e)
+    loadBtn.disabled = false
+  }
+})
+
+// ── 图片输入 ──────────────────────────────────────────────────────────────────
+imgInput.addEventListener('change', e => { if (e.target.files[0]) loadImg(e.target.files[0]) })
+drop.addEventListener('dragover',  e => { e.preventDefault(); drop.classList.add('drag') })
+drop.addEventListener('dragleave', () => drop.classList.remove('drag'))
+drop.addEventListener('drop', e => {
+  e.preventDefault(); drop.classList.remove('drag')
+  const f = e.dataTransfer.files[0]
+  if (f?.type.startsWith('image/')) loadImg(f)
+})
+
+function loadImg(file) {
+  if (lrURL) URL.revokeObjectURL(lrURL)
+  if (hrURL) URL.revokeObjectURL(hrURL)
+  hrCanvas = null; dlRow.style.display = 'none'; imgHR.src = ''
+
+  lrURL = URL.createObjectURL(file)
+  imgLR.src = lrURL
+  imgHR.src = lrURL
+  cmp.classList.add('show')
+  setDiv(50)
+
+  $('sIn').textContent = '—'
+  $('sOut').textContent = '—'
+  $('sInf').textContent = '—'
+  clrSts(runSts); clrProg(runProg)
+
+  runBtn.disabled = !pipe
+  runBtn._file = file
+  log(`图片：${file.name} (${(file.size / 1024).toFixed(0)} KB)`)
+}
+
+// ── 运行推理 ──────────────────────────────────────────────────────────────────
+runBtn.addEventListener('click', async () => {
+  if (!pipe || !runBtn._file) return
+  runBtn.disabled = true
+  setSts(runSts, 'run', '预处理…')
+  setProg(runProg, runFill, 5)
+
+  try {
+    // RawImage 从 object URL 加载
+    // Transformers.js 的 RawImage 支持 URL / HTMLImageElement / canvas
+    const rawImg = await RawImage.fromURL(lrURL)
+    $('sIn').textContent = `${rawImg.width}×${rawImg.height}`
+    log(`输入：${rawImg.width}×${rawImg.height}，开始推理…`)
+
+    setSts(runSts, 'run', 'GPU 推理中…')
+    setProg(runProg, runFill, 20)
+
+    const t0 = performance.now()
+
+    // pipeline('image-to-image') 直接接受 RawImage / URL / HTMLImageElement
+    // 内部自动处理 padding、归一化、CHW 转换，和我们 Python 里做的一样
+    const result = await pipe(rawImg)
+
+    const ms = performance.now() - t0
+    $('sInf').textContent = (ms / 1000).toFixed(2) + 's'
+    log(`推理完成，耗时 ${(ms/1000).toFixed(2)}s`, 'lok')
+
+    setProg(runProg, runFill, 80)
+    setSts(runSts, 'run', '渲染结果…')
+
+    // result 是 RawImage，转换到 canvas
+    hrCanvas = rawImgToCanvas(result)
+    $('sOut').textContent = `${result.width}×${result.height}`
+    log(`输出：${result.width}×${result.height}`, 'lok')
+
+    if (hrURL) URL.revokeObjectURL(hrURL)
+    hrURL = hrCanvas.toDataURL()
+    imgHR.src = hrURL
+
+    setProg(runProg, runFill, 100)
+    setTimeout(() => clrProg(runProg), 500)
+    setSts(runSts, 'ok', `✓ 完成（${(ms/1000).toFixed(2)}s）`)
+    dlRow.style.display = 'flex'
+
+  } catch (e) {
+    setSts(runSts, 'err', e.message)
+    log('推理失败：' + e.message, 'lerr')
+    console.error(e)
+  }
+
+  runBtn.disabled = false
+})
+
+// ── RawImage → Canvas ──────────────────────────────────────────────────────────
+function rawImgToCanvas(raw) {
+  const cv  = document.createElement('canvas')
+  cv.width  = raw.width
+  cv.height = raw.height
+  const ctx = cv.getContext('2d')
+  const id  = ctx.createImageData(raw.width, raw.height)
+
+  // RawImage.data 是 Uint8ClampedArray，排列是 HWC RGB 或 RGBA
+  // channels: raw.channels (1/3/4)
+  const src = raw.data
+  const ch  = raw.channels
+  for (let i = 0; i < raw.width * raw.height; i++) {
+    id.data[i * 4 + 0] = src[i * ch + 0]
+    id.data[i * 4 + 1] = src[i * ch + 1] ?? src[i * ch + 0]
+    id.data[i * 4 + 2] = src[i * ch + 2] ?? src[i * ch + 0]
+    id.data[i * 4 + 3] = ch === 4 ? src[i * ch + 3] : 255
+  }
+  ctx.putImageData(id, 0, 0)
+  return cv
+}
+
+// ── 下载 ──────────────────────────────────────────────────────────────────────
+dlBtn.addEventListener('click', () => {
+  if (!hrCanvas) return
+  const a = document.createElement('a')
+  a.href     = hrCanvas.toDataURL('image/png')
+  a.download = 'superres_x4.png'
+  a.click()
+})
+
+// ── 对比拖拽 ──────────────────────────────────────────────────────────────────
+let drag = false
+cmp.addEventListener('mousedown',  e => { drag = true; e.preventDefault() })
+cmp.addEventListener('touchstart', () => { drag = true }, { passive: true })
+document.addEventListener('mousemove', e => {
+  if (!drag) return
+  const r = cmp.getBoundingClientRect()
+  setDiv((e.clientX - r.left) / r.width * 100)
+})
+document.addEventListener('touchmove', e => {
+  if (!drag) return
+  const r = cmp.getBoundingClientRect()
+  setDiv((e.touches[0].clientX - r.left) / r.width * 100)
+}, { passive: true })
+document.addEventListener('mouseup',  () => { drag = false })
+document.addEventListener('touchend', () => { drag = false })
+
+function setDiv(pct) {
+  pct = Math.max(0, Math.min(100, pct))
+  divLine.style.left = pct + '%'
+  imgLR.style.clipPath = `inset(0 ${100 - pct}% 0 0)`
+}
+</script>
+</body>
+</html>

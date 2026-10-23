@@ -78,6 +78,26 @@
   </div>
 
   <div class="section">
+    <h2>④ AI 法线图（本地服务器）</h2>
+    <div style="font-size:0.7rem;color:#64748b;margin-bottom:6px;">
+      先启动 Python 服务器，再点生成。<br>
+      <code style="color:#a5b4fc;font-size:0.65rem;">cd server &amp;&amp; pip install -r requirements.txt &amp;&amp; python server.py</code>
+    </div>
+    <div style="display:flex;gap:4px;margin-bottom:6px;">
+      <input type="text" id="serverUrl" value="http://localhost:8000"
+             style="flex:1;padding:5px;background:#1e293b;border:1px solid #334155;
+                    border-radius:4px;color:#e2e8f0;font-size:0.72rem;">
+    </div>
+    <button id="btnNormal" disabled>生成法线图</button>
+    <canvas id="normalPreview" style="width:100%;border-radius:6px;border:1px solid #1e293b;
+                                      display:block;background:#1e293b;min-height:60px;"></canvas>
+    <div style="display:flex;align-items:center;gap:8px;margin-top:8px;">
+      <input type="checkbox" id="chkUseNormal" style="accent-color:#4f46e5;">
+      <label for="chkUseNormal" style="font-size:0.75rem;color:#94a3b8;cursor:pointer;">使用法线图打光（更精准）</label>
+    </div>
+  </div>
+
+  <div class="section">
     <h2>深度图预览</h2>
     <canvas id="depthPreview" style="width:100%;border-radius:6px;border:1px solid #1e293b;display:block;background:#1e293b;min-height:80px;"></canvas>
   </div>
@@ -169,14 +189,16 @@ const fragShader = /*glsl*/`
   precision highp float;
   in vec2 vUv;              // WebGL1: varying vec2 vUv;
 
-  uniform sampler2D uImage;      // 原始图像
-  uniform sampler2D uDepth;      // 深度图（灰度，0=近，1=远）
-  uniform vec3      uLightPos;   // 光源位置（UV空间 xy + 高度 z）
-  uniform float     uIntensity;  // 光强
-  uniform float     uSpecular;   // 高光强度
-  uniform float     uDepthScale; // 深度影响法线的强度
-  uniform float     uAmbient;    // 环境光
-  uniform vec2      uResolution; // 画布尺寸
+  uniform sampler2D uImage;       // 原始图像
+  uniform sampler2D uDepth;       // 深度图（灰度，0=近，1=远）
+  uniform sampler2D uNormal;      // AI 生成的法线图（RGB 编码法线方向）
+  uniform float     uUseNormalMap; // 1.0=用法线图, 0.0=从深度图计算
+  uniform vec3      uLightPos;    // 光源位置（UV空间 xy + 高度 z）
+  uniform float     uIntensity;   // 光强
+  uniform float     uSpecular;    // 高光强度
+  uniform float     uDepthScale;  // 深度影响法线的强度（仅深度模式用）
+  uniform float     uAmbient;     // 环境光
+  uniform vec2      uResolution;  // 画布尺寸
 
   out vec4 fragColor;       // WebGL1: 直接写 gl_FragColor，WebGL2 需要显式声明输出
 
@@ -264,13 +286,26 @@ const fragShader = /*glsl*/`
     vec3 Ty = vec3(0.0, 1.0, dzdy * uDepthScale);
 
     // ════════════════════════════════════════════════════
-    // 第四步：法线 = 两个切线的叉积
+    // 第四步：确定法线（两种模式）
     //
-    // 高中向量：两个向量确定一个平面，叉积方向垂直于这个平面
+    // 模式A（默认）：从深度图计算
+    //   两个切线叉积 → 法线，精度受深度图质量限制
+    //
+    // 模式B：使用 AI 生成的法线图
+    //   直接采样法线图，解码 RGB[0,1] → 法线XYZ[-1,1]
+    //   法线图由 Python 服务器生成，用 Sobel 算法，比这里精度更高
+    //   法线图格式：中性法线(0,0,1) = RGB(128,128,255) 蓝紫色
     // ════════════════════════════════════════════════════
-    vec3 N = cross(Tx, Ty);
-
-    vec3 normal = normalize(N); // 归一化为单位向量，长度=1，只保留方向
+    vec3 normal;
+    if (uUseNormalMap > 0.5) {
+      // 采样 AI 法线图，解码：[0,1] → [-1,1]
+      vec3 n = texture(uNormal, vUv).rgb;
+      normal = normalize(n * 2.0 - 1.0);
+    } else {
+      // 从深度图计算（有限差分）
+      vec3 N = cross(Tx, Ty);
+      normal = normalize(N);
+    }
 
     // ② 计算光源方向
     float depth  = getDepth(vUv);
@@ -313,15 +348,27 @@ const fragShader = /*glsl*/`
   }
 `;
 
+// 创建一张 1×1 的默认法线图（中性法线，正面朝外）
+// 颜色 RGB(128, 128, 255) = 法线方向 (0, 0, 1) = 正面朝相机
+// 作用：uNormal 未加载时 shader 有个合法的纹理可以采样（不会崩溃）
+const defaultNormalCanvas = document.createElement('canvas');
+defaultNormalCanvas.width = defaultNormalCanvas.height = 1;
+const defaultNormalCtx = defaultNormalCanvas.getContext('2d');
+defaultNormalCtx.fillStyle = '#8080ff'; // #80 = 128，#ff = 255
+defaultNormalCtx.fillRect(0, 0, 1, 1);
+const defaultNormalTex = new THREE.CanvasTexture(defaultNormalCanvas);
+
 const uniforms = {
-  uImage:      { value: null },
-  uDepth:      { value: null },
-  uLightPos:   { value: lightPos },
-  uIntensity:  { value: 1.5 },
-  uSpecular:   { value: 0.4 },
-  uDepthScale: { value: 0.08 },
-  uAmbient:    { value: 0.2 },
-  uResolution: { value: new THREE.Vector2(512, 512) },
+  uImage:        { value: null },
+  uDepth:        { value: null },
+  uNormal:       { value: defaultNormalTex }, // AI 法线图，默认用中性法线
+  uUseNormalMap: { value: 0.0 },              // 0=从深度图计算, 1=用法线图
+  uLightPos:     { value: lightPos },
+  uIntensity:    { value: 1.5 },
+  uSpecular:     { value: 0.4 },
+  uDepthScale:   { value: 0.08 },
+  uAmbient:      { value: 0.2 },
+  uResolution:   { value: new THREE.Vector2(512, 512) },
 };
 
 const mat  = new THREE.ShaderMaterial({
@@ -452,6 +499,8 @@ function setImage(src, crossOrigin = false) {
   img.src = src;
   if (crossOrigin) img.crossOrigin = 'anonymous';
   img.style.display = 'block';
+  // 图片选好了，法线图按钮可以用了
+  document.getElementById('btnNormal').disabled = false;
 }
 
 document.getElementById('fileInput').onchange = (e) => {
@@ -615,6 +664,95 @@ document.getElementById('btnRun').onclick = async () => {
     console.error(e);
   }
   document.getElementById('btnRun').disabled = false;
+};
+
+// ── ④ 法线图：调用本地 Python 服务器 ─────────────────────────────
+//
+// 流程：
+//   把当前图片发给 Python 服务器（POST /normal）
+//   服务器运行 Depth Anything V2 + Sobel 算法生成法线图
+//   浏览器收到法线图 PNG，创建 Three.js 纹理，传给 shader
+//
+// 为什么用 canvas 中转图片：
+//   currentImageSrc 可能是 blob://URL（本地文件）或 https:// URL（跨域）
+//   直接 fetch 跨域 URL 会被 CORS 阻止
+//   用 <img> + canvas 绕过：img 能加载跨域图（设置 crossOrigin），
+//   画到 canvas 后 toBlob() 拿到 Blob，再发给服务器
+document.getElementById('btnNormal').onclick = async () => {
+  if (!currentImageSrc) { log('请先选择图片', 'warn'); return; }
+
+  const serverUrl = document.getElementById('serverUrl').value.replace(/\/$/, '');
+  const btn = document.getElementById('btnNormal');
+  btn.disabled = true;
+  log('▶ 连接本地服务器，生成法线图...', 'info');
+
+  try {
+    // 把当前图片加载到 canvas，转为 Blob，才能发给服务器
+    const blob = await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        const c = document.createElement('canvas');
+        c.width = img.width;
+        c.height = img.height;
+        c.getContext('2d').drawImage(img, 0, 0);
+        c.toBlob(resolve, 'image/jpeg', 0.9);
+      };
+      img.onerror = () => reject(new Error('图片加载失败'));
+      img.src = currentImageSrc;
+    });
+
+    // POST 图片到服务器
+    const formData = new FormData();
+    formData.append('file', blob, 'image.jpg');
+
+    const t0 = performance.now();
+    const res = await fetch(`${serverUrl}/normal`, { method: 'POST', body: formData });
+    if (!res.ok) throw new Error(`服务器返回错误 ${res.status}，请检查 Python 服务器是否启动`);
+
+    // 收到法线图 PNG，创建 Object URL
+    const normalBlob = await res.blob();
+    const normalUrl = URL.createObjectURL(normalBlob);
+
+    // 画到 normalPreview canvas，同时创建 Three.js 纹理
+    const normalImg = new Image();
+    normalImg.onload = () => {
+      // 显示侧栏预览
+      const preview = document.getElementById('normalPreview');
+      preview.width  = normalImg.width;
+      preview.height = normalImg.height;
+      preview.getContext('2d').drawImage(normalImg, 0, 0);
+
+      // 创建 Three.js 纹理并传给 shader
+      const normalTex = new THREE.CanvasTexture(preview);
+      normalTex.flipY = true;
+      uniforms.uNormal.value = normalTex;
+
+      // 自动勾选"使用法线图打光"
+      document.getElementById('chkUseNormal').checked = true;
+      uniforms.uUseNormalMap.value = 1.0;
+
+      const ms = (performance.now() - t0).toFixed(0);
+      log(`✓ 法线图生成完成，耗时 ${ms}ms（${normalImg.width}×${normalImg.height}）`, 'ok');
+      log('移动鼠标查看基于法线图的打光效果', 'info');
+      URL.revokeObjectURL(normalUrl);
+    };
+    normalImg.src = normalUrl;
+
+  } catch (e) {
+    log('✗ ' + e.message, 'warn');
+    log('提示：先在终端运行 cd server && python server.py', 'info');
+  }
+
+  btn.disabled = false;
+};
+
+// 法线图模式切换（勾选框）
+document.getElementById('chkUseNormal').onchange = (e) => {
+  uniforms.uUseNormalMap.value = e.target.checked ? 1.0 : 0.0;
+  log(e.target.checked
+    ? '✓ 切换到 AI 法线图模式（更精准的打光）'
+    : '切换到深度图模式（从深度图实时计算法线）', 'info');
 };
 </script>
 

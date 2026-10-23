@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Shadow Map · 神经网络 DLSS</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;500;600&display=swap">
+<style>
+:root{--bg:#080c12;--surf:#0f1520;--bd:#1e2d44;--fg:#c8d6e8;--muted:#5a6f8a;--acc:#38bdf8;--adim:#0d2035;--grn:#4ade80;--amb:#fbbf24;--red:#f87171;color-scheme:dark}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--fg);font-family:'Inter',system-ui,sans-serif;font-size:14px;display:flex;flex-direction:column;align-items:center;padding:28px 16px 40px;gap:14px}
+.eyebrow{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--acc)}
+h1{font-size:22px;font-weight:600;letter-spacing:-.02em}
+h1 em{font-style:normal;color:var(--acc)}
+.lead{font-size:12px;color:var(--muted);max-width:560px;text-align:center;line-height:1.7}
+.wrap{position:relative;border:1px solid var(--bd);border-radius:10px;overflow:hidden}
+canvas{display:block}
+.badge{position:absolute;top:10px;left:10px;font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:600;letter-spacing:.1em;padding:4px 10px;border-radius:4px;pointer-events:none}
+.badge-raw{background:rgba(248,113,113,.85);color:#000}
+.badge-sr{background:rgba(56,189,248,.85);color:#000}
+.controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:center}
+.btn{padding:7px 18px;border-radius:6px;border:none;font-size:12px;font-weight:600;cursor:pointer;font-family:'Inter',sans-serif;transition:opacity .15s}
+.btn-p{background:var(--acc);color:#000}.btn-p:hover{opacity:.85}.btn-p:disabled{opacity:.4;cursor:not-allowed}
+.btn-g{background:var(--surf);color:var(--fg);border:1px solid var(--bd)}.btn-g:hover{border-color:var(--acc);color:var(--acc)}
+.status{font-family:'JetBrains Mono',monospace;font-size:11px;padding:5px 12px;border-radius:5px;display:none;align-items:center;gap:6px}
+.status.show{display:inline-flex}
+.s-load{background:rgba(56,189,248,.1);color:var(--acc)}
+.s-ok{background:rgba(74,222,128,.1);color:var(--grn)}
+.s-err{background:rgba(248,113,113,.1);color:var(--red)}
+.spin{width:10px;height:10px;border:1.5px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.info{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)}
+.info span{color:var(--amb)}
+.sm-preview{display:flex;gap:16px;align-items:flex-end}
+.sm-canvas-wrap{text-align:center}
+.sm-canvas-wrap canvas{border:1px solid var(--bd);border-radius:4px;display:block;image-rendering:pixelated}
+.sm-label{font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--muted);margin-top:4px;text-align:center}
+</style>
+</head>
+<body>
+<div class="eyebrow">Transformers.js · WebGL2 · Neural Network</div>
+<h1>阴影渲染 · <em>神经网络 DLSS</em></h1>
+<p class="lead">Shadow map 渲染为 <strong style="color:var(--amb)">128×128</strong>，通过 <strong style="color:var(--acc)">Swin2SR 神经网络</strong>超分辨率到 <strong style="color:var(--grn)">512×512</strong>，阴影边缘从锯齿变为平滑。</p>
+
+<div class="wrap">
+  <canvas id="c" width="560" height="420"></canvas>
+  <div class="badge badge-raw" id="badge">Shadow Map 128² · 原始</div>
+</div>
+
+<div class="controls">
+  <button id="loadBtn" class="btn btn-p">⬇ 加载神经网络</button>
+  <button id="srBtn"   class="btn btn-g" disabled>⚡ 运行神经网络超分</button>
+  <button id="togBtn"  class="btn btn-g" disabled>切换: 原始 / SR</button>
+  <div id="sts" class="status"></div>
+</div>
+
+<div class="sm-preview">
+  <div class="sm-canvas-wrap">
+    <canvas id="smRaw" width="128" height="128"></canvas>
+    <div class="sm-label">Shadow Map 原始 128²</div>
+  </div>
+  <div class="sm-canvas-wrap" id="smSRWrap" style="opacity:.3">
+    <canvas id="smSR" width="128" height="128"></canvas>
+    <div class="sm-label" id="smSRLabel">SR 结果（待运行）</div>
+  </div>
+</div>
+
+<div class="info">阴影图: <span id="infoRes">128 × 128</span> &nbsp;·&nbsp; 状态: <span id="infoState">原始</span></div>
+
+<script type="module">
+import { pipeline, RawImage } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.3/dist/transformers.min.js'
+
+// ── 矩阵（列主序）────────────────────────────────────────────────
+function perspective(fov, aspect, near, far) {
+  const f = 1 / Math.tan(fov / 2), m = new Float32Array(16)
+  m[0]=f/aspect; m[5]=f; m[10]=(far+near)/(near-far); m[11]=-1; m[14]=2*far*near/(near-far)
+  return m
+}
+function ortho(l, r, b, t, near, far) {
+  const m = new Float32Array(16)
+  m[0]=2/(r-l); m[5]=2/(t-b); m[10]=-2/(far-near)
+  m[12]=-(r+l)/(r-l); m[13]=-(t+b)/(t-b); m[14]=-(far+near)/(far-near); m[15]=1
+  return m
+}
+function lookAt(ex,ey,ez, cx,cy,cz) {
+  let fx=cx-ex,fy=cy-ey,fz=cz-ez
+  const fl=Math.hypot(fx,fy,fz); fx/=fl; fy/=fl; fz/=fl
+  let rx=-fz, ry=0, rz=fx
+  const rl=Math.hypot(rx,ry,rz); rx/=rl; ry/=rl; rz/=rl
+  const ux=ry*fz-rz*fy, uy=rz*fx-rx*fz, uz=rx*fy-ry*fx
+  const m = new Float32Array(16)
+  m[0]=rx; m[4]=ry; m[8]=rz;   m[12]=-(rx*ex+ry*ey+rz*ez)
+  m[1]=ux; m[5]=uy; m[9]=uz;   m[13]=-(ux*ex+uy*ey+uz*ez)
+  m[2]=-fx;m[6]=-fy;m[10]=-fz; m[14]=fx*ex+fy*ey+fz*ez
+  m[3]=0;  m[7]=0;  m[11]=0;   m[15]=1
+  return m
+}
+function mul(a, b) {
+  const m = new Float32Array(16)
+  for (let c=0; c<4; c++) for (let r=0; r<4; r++) {
+    let s=0; for (let k=0; k<4; k++) s += a[r+k*4] * b[k+c*4]
+    m[r+c*4] = s
+  }
+  return m
+}
+function translate(x,y,z) {
+  const m=new Float32Array(16); m[0]=m[5]=m[10]=m[15]=1; m[12]=x;m[13]=y;m[14]=z; return m
+}
+const ID = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1])
+
+// ── 几何 ─────────────────────────────────────────────────────────
+// 地面：[0,2,1, 0,3,2] 保证从相机视角 CCW（正面可见）
+function makePlane(s=5) {
+  const v = new Float32Array([-s,0,-s,0,1,0,  s,0,-s,0,1,0,  s,0,s,0,1,0, -s,0,s,0,1,0])
+  const i = new Uint16Array([0,2,1, 0,3,2])   // CCW from camera
+  return { v, i }
+}
+function makeSphere(R=1, W=32, H=24) {
+  const v=[], i=[]
+  for (let p=0; p<=H; p++) {
+    const th = p*Math.PI/H
+    for (let q=0; q<=W; q++) {
+      const ph = q*2*Math.PI/W
+      const x=Math.sin(th)*Math.cos(ph), y=Math.cos(th), z=Math.sin(th)*Math.sin(ph)
+      v.push(x*R, y*R, z*R, x, y, z)
+    }
+  }
+  for (let p=0; p<H; p++) for (let q=0; q<W; q++) {
+    const a=p*(W+1)+q, b=a+W+1
+    i.push(a,b,a+1, b,b+1,a+1)
+  }
+  return { v: new Float32Array(v), i: new Uint32Array(i) }
+}
+
+// ── WebGL2 ────────────────────────────────────────────────────────
+const gl = document.getElementById('c').getContext('webgl2', { antialias: true })
+if (!gl) { document.body.innerHTML='<p style="color:#f87171;padding:40px">需要 WebGL2</p>'; throw 0 }
+
+function compileShader(type, src) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s)
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s))
+  return s
+}
+function makeProgram(vs, fs) {
+  const p = gl.createProgram()
+  gl.attachShader(p, compileShader(gl.VERTEX_SHADER, vs))
+  gl.attachShader(p, compileShader(gl.FRAGMENT_SHADER, fs))
+  gl.linkProgram(p)
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p))
+  return p
+}
+const U = (p, n) => gl.getUniformLocation(p, n)
+
+// ── Shaders ───────────────────────────────────────────────────────
+// Shadow pass: 深度写入颜色纹理 R 通道（readPixels 友好，可传给神经网络）
+const SHADOW_VS = `#version 300 es
+in vec3 aPos;
+uniform mat4 uLightMVP;   // lightProj * lightView * model（在阴影 pass 含模型矩阵）
+void main() { gl_Position = uLightMVP * vec4(aPos, 1.0); }`
+
+const SHADOW_FS = `#version 300 es
+precision highp float;
+out vec4 fragColor;
+void main() {
+  // gl_FragCoord.z 是深度值 [0,1]，写入 RGB 三通道（灰度），方便神经网络处理
+  fragColor = vec4(gl_FragCoord.z, gl_FragCoord.z, gl_FragCoord.z, 1.0);
+}`
+
+// 主渲染 pass
+// 关键：uLightVP 只传 lightVP（不含模型矩阵），shader 自己乘以 worldPos
+const MAIN_VS = `#version 300 es
+in vec3 aPos;
+in vec3 aNormal;
+uniform mat4 uMVP;
+uniform mat4 uModel;
+uniform mat4 uLightVP;   // 光源 VP，不含模型矩阵！
+out vec3 vNormal;
+out vec3 vWorldPos;
+out vec4 vLightSpacePos;
+void main() {
+  vec4 worldPos = uModel * vec4(aPos, 1.0);
+  gl_Position   = uMVP * worldPos;
+  vNormal       = mat3(uModel) * aNormal;
+  vWorldPos     = worldPos.xyz;
+  // worldPos 已是世界坐标，再乘 lightVP 即可得到光源裁剪坐标
+  vLightSpacePos = uLightVP * worldPos;
+}`
+
+const MAIN_FS = `#version 300 es
+precision highp float;
+in vec3 vNormal;
+in vec3 vWorldPos;
+in vec4 vLightSpacePos;
+uniform sampler2D uShadowMap;   // 128² 或 512²（SR 后）颜色纹理，R=深度
+uniform vec3 uLightDir;
+uniform vec3 uColor;
+out vec4 fragColor;
+
+float shadowTest() {
+  vec3 p = vLightSpacePos.xyz / vLightSpacePos.w;
+  p = p * 0.5 + 0.5;
+  if (p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0) return 1.0;
+  float shadowDepth = texture(uShadowMap, p.xy).r;
+  // shadow map 清除为 R=1（无遮挡），有物体处 R=物体深度（<1）
+  // 当前片元深度 p.z 减去 bias，若大于 shadowDepth 则该片元被遮挡
+  float bias = 0.005;
+  return (p.z - bias > shadowDepth) ? 0.0 : 1.0;
+}
+
+void main() {
+  float shadow = shadowTest();
+  float NdotL  = max(dot(normalize(vNormal), normalize(uLightDir)), 0.0);
+  float ambient = 0.15;
+  float diffuse = NdotL * shadow * 0.85;
+  float checker = 1.0;
+  if (abs(vNormal.y) > 0.5) {
+    vec2 g = floor(vWorldPos.xz * 1.5);
+    checker = mod(g.x + g.y, 2.0) < 1.0 ? 1.0 : 0.82;
+  }
+  fragColor = vec4(uColor * (ambient + diffuse) * checker, 1.0);
+}`
+
+const progShadow = makeProgram(SHADOW_VS, SHADOW_FS)
+const progMain   = makeProgram(MAIN_VS,   MAIN_FS)
+
+// ── VAO 工厂 ──────────────────────────────────────────────────────
+function makeVAO(geom, prog) {
+  const va = gl.createVertexArray()
+  gl.bindVertexArray(va)
+  const vb = gl.createBuffer()
+  gl.bindBuffer(gl.ARRAY_BUFFER, vb)
+  gl.bufferData(gl.ARRAY_BUFFER, geom.v, gl.STATIC_DRAW)
+  const posLoc = gl.getAttribLocation(prog, 'aPos')
+  gl.enableVertexAttribArray(posLoc)
+  gl.vertexAttribPointer(posLoc, 3, gl.FLOAT, false, 24, 0)
+  const normLoc = gl.getAttribLocation(prog, 'aNormal')
+  if (normLoc >= 0) {
+    gl.enableVertexAttribArray(normLoc)
+    gl.vertexAttribPointer(normLoc, 3, gl.FLOAT, false, 24, 12)
+  }
+  const eb = gl.createBuffer()
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, eb)
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, geom.i, gl.STATIC_DRAW)
+  gl.bindVertexArray(null)
+  return { va, count: geom.i.length, isU32: geom.i instanceof Uint32Array }
+}
+
+const planeGeo  = makePlane()
+const sphereGeo = makeSphere(1.0)
+
+const shadowPlaneVAO  = makeVAO(planeGeo,  progShadow)
+const shadowSphereVAO = makeVAO(sphereGeo, progShadow)
+const mainPlaneVAO    = makeVAO(planeGeo,  progMain)
+const mainSphereVAO   = makeVAO(sphereGeo, progMain)
+
+// ── Shadow Map FBO ────────────────────────────────────────────────
+const SHADOW_SIZE = 128
+
+function makeShadowFBO(res, filter = gl.NEAREST) {
+  const colorTex = gl.createTexture()
+  gl.bindTexture(gl.TEXTURE_2D, colorTex)
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, res, res, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+  const depthRB = gl.createRenderbuffer()
+  gl.bindRenderbuffer(gl.RENDERBUFFER, depthRB)
+  gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, res, res)
+  const fbo = gl.createFramebuffer()
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, colorTex, 0)
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depthRB)
+  const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER)
+  if (status !== gl.FRAMEBUFFER_COMPLETE) console.error('FBO 不完整:', status)
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+  return { fbo, colorTex, res }
+}
+
+const rawFBO = makeShadowFBO(SHADOW_SIZE, gl.NEAREST)  // 原始 128²，最近邻采样
+let srTex = null   // 神经网络 SR 后的纹理（512²），运行后生成
+
+function uploadSRTex(img) {
+  if (srTex) gl.deleteTexture(srTex)
+  srTex = gl.createTexture()
+  gl.bindTexture(gl.TEXTURE_2D, srTex)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, img)
+}
+
+// ── 场景参数 ──────────────────────────────────────────────────────
+const W = 560, H = 420
+const sphereModel = translate(0, 1, 0)   // 球心在 y=1，半径 1，底部贴地
+const camVP = mul(perspective(Math.PI/4, W/H, 0.1, 50), lookAt(5, 6, 8, 0, 0, 0))
+
+function drawElements(vao) {
+  gl.bindVertexArray(vao.va)
+  gl.drawElements(gl.TRIANGLES, vao.count, vao.isU32 ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT, 0)
+}
+
+let useSR = false, time = 0, lastTS = 0
+
+function render(ts) {
+  requestAnimationFrame(render)
+  const dt = Math.min((ts - lastTS) / 1000, 0.05)
+  lastTS = ts
+  time += dt * 0.4
+
+  const lx = Math.cos(time)*7, ly = 8, lz = Math.sin(time)*5
+  const lightVP = mul(
+    ortho(-6, 6, -6, 6, 0.5, 30),
+    lookAt(lx, ly, lz, 0, 0, 0)
+  )
+  const ld = Math.hypot(lx, ly, lz)
+  const lightDir = [lx/ld, ly/ld, lz/ld]
+
+  // ── Pass 1: Shadow pass（渲染到 rawFBO）─────────────────────────
+  gl.bindFramebuffer(gl.FRAMEBUFFER, rawFBO.fbo)
+  gl.viewport(0, 0, SHADOW_SIZE, SHADOW_SIZE)
+  // 关键：清除为 R=1（无遮挡最大深度），否则空白区域 R=0 导致全体阴影
+  gl.clearColor(1, 1, 1, 1)
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+  gl.enable(gl.DEPTH_TEST)
+  gl.disable(gl.CULL_FACE)   // 不剔除，确保球和地面都写入 shadow map
+
+  gl.useProgram(progShadow)
+  // 地面：uLightMVP = lightVP * identity = lightVP
+  gl.uniformMatrix4fv(U(progShadow, 'uLightMVP'), false, lightVP)
+  drawElements(shadowPlaneVAO)
+  // 球：uLightMVP = lightVP * sphereModel（在阴影 pass 需要含模型矩阵）
+  gl.uniformMatrix4fv(U(progShadow, 'uLightMVP'), false, mul(lightVP, sphereModel))
+  drawElements(shadowSphereVAO)
+
+  // ── Pass 2: 主渲染 pass ──────────────────────────────────────────
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+  gl.viewport(0, 0, W, H)
+  gl.clearColor(0.05, 0.08, 0.14, 1)
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+  gl.enable(gl.DEPTH_TEST)
+  gl.enable(gl.CULL_FACE)
+  gl.cullFace(gl.BACK)
+
+  gl.useProgram(progMain)
+  gl.uniform3fv(U(progMain, 'uLightDir'), lightDir)
+  // 选择 shadow 纹理：原始 128² 或神经网络 SR 后的 512²
+  const shadowTex = (useSR && srTex) ? srTex : rawFBO.colorTex
+  gl.activeTexture(gl.TEXTURE0)
+  gl.bindTexture(gl.TEXTURE_2D, shadowTex)
+  gl.uniform1i(U(progMain, 'uShadowMap'), 0)
+
+  // 地面（model = identity）
+  gl.uniformMatrix4fv(U(progMain, 'uMVP'),      false, camVP)
+  gl.uniformMatrix4fv(U(progMain, 'uModel'),     false, ID)
+  // uLightVP 只传 lightVP（不含模型矩阵！shader 会乘以 worldPos）
+  gl.uniformMatrix4fv(U(progMain, 'uLightVP'),   false, lightVP)
+  gl.uniform3f(U(progMain, 'uColor'), 0.55, 0.58, 0.65)
+  drawElements(mainPlaneVAO)
+
+  // 球体（model = sphereModel）
+  gl.uniformMatrix4fv(U(progMain, 'uMVP'),      false, mul(camVP, sphereModel))
+  gl.uniformMatrix4fv(U(progMain, 'uModel'),     false, sphereModel)
+  // 同样只传 lightVP，不含 sphereModel（shader 里 worldPos = uModel * aPos，已经包含了）
+  gl.uniformMatrix4fv(U(progMain, 'uLightVP'),   false, lightVP)
+  gl.uniform3f(U(progMain, 'uColor'), 0.55, 0.70, 0.95)
+  drawElements(mainSphereVAO)
+
+  // 定期更新原始 shadow map 预览
+  if (Math.floor(time * 4) % 4 === 0) updateRawPreview()
+}
+
+// ── 原始 Shadow Map 预览 ──────────────────────────────────────────
+const rawCtx = document.getElementById('smRaw').getContext('2d')
+function updateRawPreview() {
+  const buf = new Uint8Array(SHADOW_SIZE * SHADOW_SIZE * 4)
+  gl.bindFramebuffer(gl.FRAMEBUFFER, rawFBO.fbo)
+  gl.readPixels(0, 0, SHADOW_SIZE, SHADOW_SIZE, gl.RGBA, gl.UNSIGNED_BYTE, buf)
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+  const id = rawCtx.createImageData(SHADOW_SIZE, SHADOW_SIZE)
+  for (let y = 0; y < SHADOW_SIZE; y++) for (let x = 0; x < SHADOW_SIZE; x++) {
+    const src = ((SHADOW_SIZE-1-y)*SHADOW_SIZE+x)*4, dst = (y*SHADOW_SIZE+x)*4
+    id.data[dst] = id.data[dst+1] = id.data[dst+2] = buf[src]
+    id.data[dst+3] = 255
+  }
+  rawCtx.putImageData(id, 0, 0)
+}
+
+// ── 启动渲染 ──────────────────────────────────────────────────────
+lastTS = performance.now()
+requestAnimationFrame(render)
+
+// ── Transformers.js 神经网络 ──────────────────────────────────────
+let pipe = null
+const loadBtn = document.getElementById('loadBtn')
+const srBtn   = document.getElementById('srBtn')
+const togBtn  = document.getElementById('togBtn')
+const sts     = document.getElementById('sts')
+const badge   = document.getElementById('badge')
+
+function setSts(type, msg) {
+  const map = { load: 's-load', ok: 's-ok', err: 's-err' }
+  sts.className = 'status show ' + (map[type] || '')
+  sts.innerHTML = type === 'load' ? `<span class="spin"></span>${msg}` : msg
+}
+
+loadBtn.addEventListener('click', async () => {
+  loadBtn.disabled = true
+  setSts('load', '加载 Swin2SR 神经网络…（~60MB，首次下载后缓存）')
+  try {
+    pipe = await pipeline('image-to-image', 'Xenova/swin2SR-classical-sr-x4-64', {
+      progress_callback(p) {
+        if (p.status === 'downloading') {
+          const mb = (p.loaded/1024/1024).toFixed(1), tot = p.total ? (p.total/1024/1024).toFixed(1) : '?'
+          setSts('load', `下载中 ${mb}/${tot} MB…`)
+        }
+      }
+    })
+    setSts('ok', '✓ 神经网络就绪')
+    srBtn.disabled = false
+  } catch (e) {
+    setSts('err', '加载失败：' + e.message)
+    loadBtn.disabled = false
+  }
+})
+
+// ── 核心：从当前 shadow map FBO 采样，返回 Canvas ─────────────────
+function captureShadowCanvas() {
+  const buf = new Uint8Array(SHADOW_SIZE * SHADOW_SIZE * 4)
+  gl.bindFramebuffer(gl.FRAMEBUFFER, rawFBO.fbo)
+  gl.readPixels(0, 0, SHADOW_SIZE, SHADOW_SIZE, gl.RGBA, gl.UNSIGNED_BYTE, buf)
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+  const cvs = document.createElement('canvas')
+  cvs.width = cvs.height = SHADOW_SIZE
+  const ctx = cvs.getContext('2d')
+  const id = ctx.createImageData(SHADOW_SIZE, SHADOW_SIZE)
+  for (let y = 0; y < SHADOW_SIZE; y++) for (let x = 0; x < SHADOW_SIZE; x++) {
+    const src = ((SHADOW_SIZE-1-y)*SHADOW_SIZE+x)*4, dst = (y*SHADOW_SIZE+x)*4
+    const d = buf[src]
+    id.data[dst] = id.data[dst+1] = id.data[dst+2] = d; id.data[dst+3] = 255
+  }
+  ctx.putImageData(id, 0, 0)
+  return cvs
+}
+
+// ── SR 推理单次（返回推理耗时 ms）────────────────────────────────
+async function runOneSR() {
+  const inputCanvas = captureShadowCanvas()
+  const t0 = performance.now()
+  const rawIn = await RawImage.fromURL(inputCanvas.toDataURL())
+  const result = await pipe(rawIn)
+  const ms = performance.now() - t0
+
+  const outCanvas = document.createElement('canvas')
+  outCanvas.width = result.width; outCanvas.height = result.height
+  const octx = outCanvas.getContext('2d')
+  const oid = octx.createImageData(result.width, result.height)
+  const ch = result.channels
+  for (let i = 0; i < result.width * result.height; i++) {
+    oid.data[i*4+0] = result.data[i*ch+0]
+    oid.data[i*4+1] = result.data[i*ch+(ch>1?1:0)]
+    oid.data[i*4+2] = result.data[i*ch+(ch>2?2:0)]
+    oid.data[i*4+3] = 255
+  }
+  octx.putImageData(oid, 0, 0)
+  return { canvas: outCanvas, width: result.width, height: result.height, ms }
+}
+
+// ── 持续 SR 循环：每次推理完成后立即用最新 shadow map 开始下一次 ─
+let srLoopRunning = false
+
+async function srLoop() {
+  if (srLoopRunning) return
+  srLoopRunning = true
+  let frameCount = 0
+
+  while (useSR && pipe) {
+    setSts('load', `推理中…（第 ${++frameCount} 帧）`)
+    try {
+      const { canvas, width, height, ms } = await runOneSR()
+
+      // 推理期间光源已旋转，结果对应的是推理开始时刻的 shadow map
+      // 立即上传到 GPU，渲染循环下一帧就生效
+      uploadSRTex(canvas)
+
+      // 更新 SR 预览
+      const smSR = document.getElementById('smSR')
+      smSR.getContext('2d').drawImage(canvas, 0, 0, 128, 128)
+      document.getElementById('smSRWrap').style.opacity = '1'
+      document.getElementById('smSRLabel').textContent = `SR #${frameCount}  ${width}²  ${(ms/1000).toFixed(1)}s`
+
+      setSts('ok', `✓ #${frameCount} | ${width}² | ${(ms/1000).toFixed(1)}s/帧`)
+    } catch (e) {
+      setSts('err', '推理失败：' + e.message)
+      console.error(e)
+      break
+    }
+  }
+  srLoopRunning = false
+  if (!useSR) setSts('ok', '已切换到原始模式')
+}
+
+// ── 按钮：首次点击启动 SR 循环 ────────────────────────────────────
+srBtn.addEventListener('click', async () => {
+  if (!pipe) return
+  srBtn.disabled = true
+
+  // 切到 SR 显示模式
+  useSR = true
+  badge.className = 'badge badge-sr'
+  badge.textContent = 'Shadow Map 512² · Swin2SR（实时更新）'
+  document.getElementById('infoRes').textContent = '512 × 512'
+  document.getElementById('infoState').textContent = '神经网络 SR（持续推理）'
+  togBtn.disabled = false
+
+  // 启动持续推理循环
+  srLoop()
+})
+
+togBtn.addEventListener('click', () => {
+  useSR = !useSR
+  if (useSR) {
+    badge.className = 'badge badge-sr'
+    badge.textContent = 'Shadow Map 512² · Swin2SR（实时更新）'
+    document.getElementById('infoRes').textContent = '512 × 512'
+    document.getElementById('infoState').textContent = '神经网络 SR（持续推理）'
+    // 恢复循环（togBtn 关闭后再开，循环已退出需重启）
+    srLoop()
+  } else {
+    badge.className = 'badge badge-raw'
+    badge.textContent = 'Shadow Map 128² · 原始'
+    document.getElementById('infoRes').textContent = '128 × 128'
+    document.getElementById('infoState').textContent = '原始（循环已停）'
+    // useSR=false 会让 srLoop 在下次 while 检查时自然退出
+  }
+})
+</script>
+</body>
+</html>

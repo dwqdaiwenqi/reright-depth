@@ -1,0 +1,774 @@
+<title>Depth Tester</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+<style>
+  :root {
+    --bg:      #0f1117;
+    --surface: #181c27;
+    --border:  #2a2f3f;
+    --fg:      #e2e6f0;
+    --muted:   #7a8099;
+    --accent:  #4f9ef8;
+    --accent2: #38e8c0;
+    --err:     #f87171;
+    --success: #4ade80;
+    --radius:  10px;
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg:      #f4f6fb;
+      --surface: #ffffff;
+      --border:  #dde2ee;
+      --fg:      #1a1e2e;
+      --muted:   #6b7494;
+      color-scheme: light;
+    }
+  }
+  :root[data-theme="light"] {
+    --bg:      #f4f6fb; --surface: #ffffff; --border: #dde2ee;
+    --fg:      #1a1e2e; --muted:   #6b7494; color-scheme: light;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; }
+
+  body {
+    background: var(--bg); color: var(--fg);
+    font-family: 'Inter', system-ui, sans-serif;
+    font-size: 14px; line-height: 1.6;
+    padding-block: 32px;
+    padding-left:  max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    min-height: 100%;
+  }
+
+  .page { max-width: 1200px; margin: 0 auto; display: flex; flex-direction: column; gap: 20px; }
+
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  header h1 { font-size: 20px; font-weight: 600; letter-spacing: -.3px; }
+  header h1 span { color: var(--accent2); }
+  .badge {
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    color: var(--accent);
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+    padding: 2px 8px; border-radius: 20px;
+  }
+
+  .config {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 12px 18px;
+    display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+  }
+  .config-group { display: flex; align-items: center; gap: 8px; }
+  .config label { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .config input, .config select {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--fg); font-family: 'JetBrains Mono', monospace; font-size: 13px;
+    padding: 5px 10px; outline: none; transition: border-color .15s;
+  }
+  .config input { width: 210px; }
+  .config input:focus, .config select:focus { border-color: var(--accent); }
+  .status-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--muted); transition: background .3s; flex-shrink: 0;
+  }
+  .status-dot.ok   { background: var(--success); }
+  .status-dot.err  { background: var(--err); }
+  .status-dot.busy { background: var(--accent); animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+  /* top row: input + depth */
+  .top-row {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+  }
+  @media (max-width: 680px) { .top-row { grid-template-columns: 1fr; } }
+
+  /* lighting panel: full width */
+  .lighting-panel { width: 100%; }
+
+  .panel {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); display: flex; flex-direction: column; overflow: hidden;
+  }
+  .panel-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 16px; border-bottom: 1px solid var(--border);
+    font-size: 11px; font-weight: 600; letter-spacing: .5px;
+    text-transform: uppercase; color: var(--muted); flex-shrink: 0;
+  }
+  .panel-head span { font-family: 'JetBrains Mono', monospace; font-weight: 400; text-transform: none; }
+  .panel-body { flex: 1; padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+
+  .dropzone {
+    border: 2px dashed var(--border); border-radius: 8px; min-height: 220px;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 10px; cursor: pointer; transition: border-color .15s, background .15s;
+    position: relative; overflow: hidden;
+  }
+  .dropzone:hover, .dropzone.drag-over {
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 5%, transparent);
+  }
+  .dropzone input[type=file] { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+  .dropzone-icon { font-size: 32px; line-height: 1; }
+  .dropzone p { color: var(--muted); text-align: center; font-size: 13px; }
+  .dropzone p strong { color: var(--fg); }
+  .preview-img {
+    width: 100%; display: block; max-height: 300px; object-fit: contain; border-radius: 6px;
+    background: repeating-conic-gradient(#3333 0% 25%, transparent 0% 50%) 0 0 / 16px 16px;
+  }
+
+  .result-wrap {
+    min-height: 220px; border-radius: 8px; overflow: hidden;
+    background: repeating-conic-gradient(#3333 0% 25%, transparent 0% 50%) 0 0 / 16px 16px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .result-wrap img { width: 100%; display: block; }
+  .empty-hint { color: var(--muted); font-size: 13px; }
+
+  .params { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  .field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .field label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
+  .field input, .field select {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--fg); font-size: 13px; padding: 6px 10px; outline: none;
+    transition: border-color .15s; font-family: inherit;
+  }
+  .field input:focus, .field select:focus { border-color: var(--accent); }
+  .field input[type=range] { padding: 0; accent-color: var(--accent); cursor: pointer; width: 110px; }
+  .range-val {
+    font-family: 'JetBrains Mono', monospace; font-size: 12px;
+    color: var(--accent); min-width: 32px;
+  }
+
+  .btn {
+    background: var(--accent); color: #fff; border: none; border-radius: 7px;
+    padding: 8px 20px; font-family: inherit; font-size: 14px; font-weight: 600;
+    cursor: pointer; transition: opacity .15s, transform .1s;
+    display: flex; align-items: center; gap: 8px; align-self: flex-start;
+  }
+  .btn:hover:not(:disabled) { opacity: .88; }
+  .btn:active:not(:disabled) { transform: scale(.97); }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+
+  .log {
+    font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--muted);
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px 12px; min-height: 44px; white-space: pre-wrap;
+    word-break: break-all; line-height: 1.7;
+  }
+  .log .ok   { color: var(--success); }
+  .log .err  { color: var(--err); }
+  .log .info { color: var(--accent); }
+
+  .meta { font-size: 12px; color: var(--muted); font-family: 'JetBrains Mono', monospace; }
+
+  /* lighting panel */
+  .lighting-body {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 16px;
+    padding: 16px;
+    align-items: start;
+  }
+  @media (max-width: 780px) { .lighting-body { grid-template-columns: 1fr; } }
+
+  #threeCanvas {
+    width: 100%; display: block; border-radius: 8px;
+    background: #000; cursor: crosshair;
+    /* aspect-ratio set dynamically from image dimensions */
+  }
+  .light-hint {
+    font-size: 11px; color: var(--muted); text-align: center;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .canvas-wrap { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+
+  .light-controls {
+    display: flex; flex-direction: column; gap: 12px;
+    min-width: 180px;
+  }
+  .light-controls .field { flex-direction: row; align-items: center; justify-content: space-between; gap: 8px; }
+  .light-controls .field label { white-space: nowrap; }
+  .light-controls .field input[type=range] { width: 90px; }
+  .ctrl-group-title {
+    font-size: 10px; font-weight: 600; letter-spacing: .6px;
+    text-transform: uppercase; color: var(--muted);
+    border-bottom: 1px solid var(--border); padding-bottom: 6px;
+  }
+  .lighting-idle {
+    height: 200px; display: flex; align-items: center; justify-content: center;
+    color: var(--muted); font-size: 13px; border-radius: 8px;
+    border: 2px dashed var(--border);
+  }
+</style>
+
+<div class="page">
+  <header>
+    <h1>Depth <span>Tester</span></h1>
+    <div class="badge">Depth Anything V2</div>
+  </header>
+
+  <div class="config">
+    <div class="config-group">
+      <div class="status-dot" id="dot"></div>
+      <label>Server</label>
+      <input type="text" id="serverUrl" value="http://localhost:8080" placeholder="http://localhost:7860">
+    </div>
+    <div class="config-group">
+      <label>Model</label>
+      <select id="sizeGlobal">
+        <option value="small">small (~100 MB)</option>
+        <option value="base">base (~400 MB)</option>
+        <option value="large">large (~1.3 GB)</option>
+      </select>
+    </div>
+  </div>
+
+  <!-- top row: input + depth -->
+  <div class="top-row">
+    <div class="panel">
+      <div class="panel-head">Input <span id="imgDims"></span></div>
+      <div class="panel-body">
+        <div class="dropzone" id="dropzone">
+          <input type="file" id="fileInput" accept="image/*">
+          <div class="dropzone-icon">🖼</div>
+          <p><strong>Click or drag</strong> an image<br>PNG / JPG / WebP</p>
+        </div>
+        <div class="params">
+          <div class="field">
+            <label>Scale</label>
+            <div style="display:flex;align-items:center;gap:8px">
+              <input type="range" id="scale" min="1" max="15" step="0.5" value="5">
+              <span class="range-val" id="scaleVal">5</span>
+            </div>
+          </div>
+          <div class="field">
+            <label>Model size</label>
+            <select id="sizeLocal">
+              <option value="">— global —</option>
+              <option value="small">small</option>
+              <option value="base">base</option>
+              <option value="large">large</option>
+            </select>
+          </div>
+        </div>
+        <button class="btn" id="runBtn" disabled>
+          <span id="btnIcon">▶</span>
+          <span id="btnLabel">Run Depth</span>
+        </button>
+        <div class="log" id="log">waiting for image…</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">Depth Map <span class="meta" id="timing"></span></div>
+      <div class="panel-body">
+        <div class="result-wrap" id="resultWrap">
+          <span class="empty-hint">result appears here</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- lighting panel: full width -->
+  <div class="panel lighting-panel">
+    <div class="panel-head">
+      Lighting Preview
+      <span>move mouse over canvas · depth map required</span>
+    </div>
+    <div class="lighting-body">
+      <div class="canvas-wrap">
+        <div class="lighting-idle" id="lightingIdle">run depth estimation first</div>
+        <canvas id="threeCanvas" hidden></canvas>
+        <div class="light-hint" id="lightHint" hidden>move mouse to control light XY</div>
+      </div>
+      <div class="light-controls">
+        <div class="ctrl-group-title">Light</div>
+        <div class="field">
+          <label>Intensity</label>
+          <div style="display:flex;align-items:center;gap:6px">
+            <input type="range" id="sIntensity" min="0" max="4" step="0.05" value="1.5">
+            <span class="range-val" id="vIntensity">1.5</span>
+          </div>
+        </div>
+        <div class="field">
+          <label>Height Z</label>
+          <div style="display:flex;align-items:center;gap:6px">
+            <input type="range" id="sHeight" min="0.2" max="3" step="0.05" value="1.5">
+            <span class="range-val" id="vHeight">1.5</span>
+          </div>
+        </div>
+        <div class="field">
+          <label>Ambient</label>
+          <div style="display:flex;align-items:center;gap:6px">
+            <input type="range" id="sAmbient" min="0" max="1" step="0.02" value="0.2">
+            <span class="range-val" id="vAmbient">0.2</span>
+          </div>
+        </div>
+        <div class="ctrl-group-title" style="margin-top:4px">Shadow</div>
+        <div class="field">
+          <label>Algorithm</label>
+          <select id="sShadowMode" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--fg);font-size:12px;padding:4px 8px;outline:none;">
+            <option value="0">无阴影</option>
+            <option value="1">距离衰减</option>
+            <option value="2">硬阴影</option>
+            <option value="3" selected>Ray March 软阴影</option>
+            <option value="4">Ray March + 抖动</option>
+          </select>
+        </div>
+        <div class="ctrl-group-title" style="margin-top:4px">Surface</div>
+        <div class="field">
+          <label>Depth Scale</label>
+          <div style="display:flex;align-items:center;gap:6px">
+            <input type="range" id="sDepthScale" min="0.01" max="0.5" step="0.01" value="0.08">
+            <span class="range-val" id="vDepthScale">0.08</span>
+          </div>
+        </div>
+        <div class="field">
+          <label>Specular</label>
+          <div style="display:flex;align-items:center;gap:6px">
+            <input type="range" id="sSpecular" min="0" max="2" step="0.05" value="0.4">
+            <span class="range-val" id="vSpecular">0.4</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id)
+
+// ── state ─────────────────────────────────────────────
+let currentFile = null
+let currentObjectURL = null
+let busy = false
+
+// ── log ───────────────────────────────────────────────
+function log(msg, cls = '') {
+  const el = $('log')
+  const line = cls ? `<span class="${cls}">${msg}</span>` : msg
+  el.innerHTML = el.innerHTML + '\n' + line
+  el.scrollTop = el.scrollHeight
+}
+function logClear(msg = '') { $('log').innerHTML = msg }
+
+function setDot(state) {
+  $('dot').className = 'status-dot' + (state !== 'idle' ? ' ' + state : '')
+}
+
+// ── drag & drop ───────────────────────────────────────
+const dz = $('dropzone')
+dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag-over') })
+dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'))
+dz.addEventListener('drop', e => {
+  e.preventDefault(); dz.classList.remove('drag-over')
+  if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0])
+})
+$('fileInput').addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]) })
+
+function loadFile(file) {
+  currentFile = file
+  if (currentObjectURL) URL.revokeObjectURL(currentObjectURL)
+  currentObjectURL = URL.createObjectURL(file)
+
+  const img = new Image()
+  img.onload = () => $('imgDims').textContent = `${img.naturalWidth}×${img.naturalHeight}`
+  img.src = currentObjectURL
+
+  dz.innerHTML = ''
+  const preview = document.createElement('img')
+  preview.className = 'preview-img'
+  preview.src = currentObjectURL
+  dz.appendChild(preview)
+
+  const fi = document.createElement('input')
+  fi.type = 'file'; fi.id = 'fileInput'; fi.accept = 'image/*'
+  fi.style.cssText = 'position:absolute;inset:0;opacity:0;cursor:pointer'
+  fi.addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]) })
+  dz.appendChild(fi)
+
+  $('runBtn').disabled = false
+  logClear('image loaded — press Run Depth')
+}
+
+$('scale').addEventListener('input', () => { $('scaleVal').textContent = $('scale').value })
+
+// ── run depth ─────────────────────────────────────────
+$('runBtn').addEventListener('click', async () => {
+  if (!currentFile || busy) return
+  busy = true
+  $('runBtn').disabled = true
+  $('btnIcon').textContent = '⏳'
+  $('btnLabel').textContent = 'Running…'
+  setDot('busy')
+  logClear()
+
+  const server = $('serverUrl').value.replace(/\/$/, '')
+  const size   = $('sizeLocal').value || $('sizeGlobal').value
+  log(`POST ${server}/depth  size=${size}`, 'info')
+
+  const form = new FormData()
+  form.append('image', currentFile)
+  form.append('size', size)
+
+  const t0 = performance.now()
+  try {
+    const res = await fetch(`${server}/depth`, { method: 'POST', body: form })
+    const elapsed = ((performance.now() - t0) / 1000).toFixed(2)
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`)
+    const data = await res.json()
+    if (data.error) throw new Error(data.error)
+
+    const depthDataUrl = `data:image/png;base64,${data.depth}`
+
+    // show depth map
+    const resultImg = document.createElement('img')
+    resultImg.src = depthDataUrl
+    resultImg.style.width = '100%'
+    $('resultWrap').innerHTML = ''
+    $('resultWrap').appendChild(resultImg)
+
+    $('timing').textContent = `${elapsed}s`
+    log(`done in ${elapsed}s`, 'ok')
+    setDot('ok')
+
+    // feed to three.js lighting
+    applyToLighting(currentObjectURL, depthDataUrl)
+
+  } catch (e) {
+    log(e.message, 'err')
+    setDot('err')
+  } finally {
+    busy = false
+    $('runBtn').disabled = false
+    $('btnIcon').textContent = '▶'
+    $('btnLabel').textContent = 'Run Depth'
+  }
+})
+
+// ══════════════════════════════════════════════════════
+// Three.js lighting
+// ══════════════════════════════════════════════════════
+
+const canvas   = $('threeCanvas')
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false })
+renderer.setPixelRatio(window.devicePixelRatio)
+
+const scene  = new THREE.Scene()
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1)
+const geo    = new THREE.PlaneGeometry(2, 2)
+
+const lightPos = new THREE.Vector3(0.5, 0.5, 1.5)
+
+// ── 核心：自定义 Shader ──────────────────────────────
+// 原理：
+//   1. 从深度图采样相邻像素的深度，用有限差分算法计算法线
+//      normal = normalize( cross(Tx, Ty) )
+//   2. 计算法线与光源方向的点积 → 漫反射（Wrapped Lambert）
+//   3. 加 Blinn-Phong 高光
+//   4. 简单光线步进（ray march）算软阴影
+const vertShader = /* glsl */`
+  out vec2 vUv;           // WebGL1: varying vec2 vUv;
+  void main() {
+    vUv = uv;
+    gl_Position = vec4(position, 1.0);
+  }
+`
+
+const fragShader = /* glsl */`
+  precision highp float;
+  in vec2 vUv;              // WebGL1: varying vec2 vUv;
+
+  uniform sampler2D uImage;      // 原始图像
+  uniform sampler2D uDepth;      // 深度图（灰度，0=近，1=远）
+  uniform vec3      uLightPos;   // 光源位置（UV空间 xy + 高度 z）
+  uniform float     uIntensity;  // 光强
+  uniform float     uSpecular;   // 高光强度
+  uniform float     uDepthScale; // 深度影响法线的强度
+  uniform float     uAmbient;    // 环境光
+  uniform vec2      uResolution; // 画布尺寸
+  uniform int       uShadowMode; // 0=无 1=衰减 2=硬阴影 3=RayMarch软 4=RayMarch+抖动
+
+  out vec4 fragColor;       // WebGL1: 直接写 gl_FragColor，WebGL2 需要显式声明输出
+
+  // 从深度图采样深度值
+  float getDepth(vec2 uv) {
+    return texture(uDepth, uv).r;  // WebGL1: texture2D(...)
+  }
+
+  void main() {
+    // px = 单个像素在UV坐标系里的大小（UV是0~1，所以1/分辨率=一个像素）
+    vec2 px = 1.0 / uResolution;
+
+    // ════════════════════════════════════════════════════
+    // 第一步：采样当前像素的上下左右四个邻居的深度值
+    //
+    //   深度图是一张灰度图，每个位置存了一个数字 d(x,y)
+    //   这个数字代表"这个像素的物体离相机多远"
+    //
+    //   dL = 左边那个像素的深度
+    //   dR = 右边那个像素的深度
+    //   dU = 上边那个像素的深度
+    //   dD = 下边那个像素的深度
+    // ════════════════════════════════════════════════════
+    float dL = getDepth(vUv + vec2(-px.x, 0.0));
+    float dR = getDepth(vUv + vec2(+px.x, 0.0));
+    float dU = getDepth(vUv + vec2(0.0, +px.y));
+    float dD = getDepth(vUv + vec2(0.0, -px.y));
+
+    // ════════════════════════════════════════════════════
+    // 第二步：用"有限差分"近似偏导数（即斜率）
+    //
+    // 【高中导数回顾】
+    //   导数 = 斜率 = 函数变化了多少 / 自变量变化了多少
+    //   精确写法：f'(x) = lim(h→0) (f(x+h) - f(x)) / h
+    //
+    // 【为什么这里不能直接用公式求导，要用"差分"？】
+    //   高中里求导，是因为你知道函数的数学表达式（比如 x²），可以直接套法则算。
+    //   但这里的深度值是从纹理贴图里采样出来的，没有公式，是个"黑盒"。
+    //   没有公式 → 没法直接求导 → 只能采两个相邻的点，用它们的差来估算斜率。
+    //   这种"用两点差来估算导数"的做法，就叫【有限差分】（大学数值分析的内容）。
+    //
+    //   本质上，差分就是在模仿导数的定义，只是 h 没法真正趋向0，
+    //   计算机只能取一个很小的实际值（这里是一个像素的宽度）：
+    //   离散近似：f'(x) ≈ (f(x+h) - f(x-h)) / (2h)  ← 左右各取一点，比单侧更准
+    //                                                     这叫"中心差分"
+    //
+    // 【偏导数是什么】
+    //   深度 d 同时受 x 和 y 影响，是二元函数 d(x, y)
+    //   偏导数 = 只让一个变量动，另一个变量固定不动时的斜率
+    //
+    //   ∂d/∂x = 只让 X 动，Y 固定 → 体现在采样时 Y偏移量=0：
+    //     dL = getDepth(vUv + vec2(-px.x,  0.0 ))  ← X左移，Y=0不动
+    //     dR = getDepth(vUv + vec2(+px.x,  0.0 ))  ← X右移，Y=0不动
+    //     ∂d/∂x ≈ (dR - dL) / (2·px.x)
+    //     意思：往右走一像素，深度变化多少
+    //
+    //   ∂d/∂y = 只让 Y 动，X 固定 → 体现在采样时 X偏移量=0：
+    //     dU = getDepth(vUv + vec2( 0.0, +px.y))  ← Y上移，X=0不动
+    //     dD = getDepth(vUv + vec2( 0.0, -px.y))  ← Y下移，X=0不动
+    //     ∂d/∂y ≈ (dU - dD) / (2·px.y)
+    //     意思：往上走一像素，深度变化多少
+    //
+    //   "固定另一个变量"在代码里就是：偏移向量里那个方向写 0.0
+    // ════════════════════════════════════════════════════
+    float dzdx = (dR - dL) / (2.0 * px.x); // X方向偏导：Y固定，X左右采样
+    float dzdy = (dU - dD) / (2.0 * px.y); // Y方向偏导：X固定，Y上下采样
+
+    // ════════════════════════════════════════════════════
+    // 第三步：构造曲面的两个切线向量
+    //
+    // 深度图定义了一个三维曲面，每个点是 P(x, y, d(x,y))
+    //
+    // 沿X方向移动一小步：
+    //   从 (x, y, d) 到 (x+1, y, d+dzdx)
+    //   切线Tx = 终点 - 起点 = (1, 0, dzdx)
+    //
+    // 沿Y方向移动一小步：
+    //   从 (x, y, d) 到 (x, y+1, d+dzdy)
+    //   切线Ty = 终点 - 起点 = (0, 1, dzdy)
+    // ════════════════════════════════════════════════════
+    // uDepthScale 放进切线向量的 Z 分量：控制斜率对法线的影响强度
+    //   小 → 切线接近水平 → 法线接近(0,0,1)垂直向上 → 光照平缓
+    //   大 → 切线倾斜明显 → 法线倾斜明显 → 凹凸感强
+    vec3 Tx = vec3(1.0, 0.0, dzdx * uDepthScale);
+    vec3 Ty = vec3(0.0, 1.0, dzdy * uDepthScale);
+
+    // ════════════════════════════════════════════════════
+    // 第四步：法线 = 两个切线的叉积
+    //
+    // 高中向量：两个向量确定一个平面，叉积方向垂直于这个平面
+    // ════════════════════════════════════════════════════
+    vec3 normal = normalize(cross(Tx, Ty)); // 归一化为单位向量，长度=1，只保留方向
+
+    // 当前像素在 3D 空间的位置（UV xy + 深度 z）
+    float depth   = getDepth(vUv);
+    vec3  pos     = vec3(vUv, depth);             // 当前像素3D位置
+    vec3  toLight = normalize(uLightPos - pos);   // 指向光源的单位向量
+
+    // ③ 漫反射（Wrapped Lambert，比标准 Lambert 更柔和）
+    //
+    //   标准 Lambert：diffuse = dot(N, L)，背光面直接=0，过渡太硬
+    //   Wrapped Lambert：wrap 参数把暗部"包裹"一点，让背光面也有一点亮度
+    //     diffuse = clamp((dot(N,L) + wrap) / (1 + wrap), 0, 1)
+    float wrap    = 0.3;
+    float diffuse = clamp((dot(normal, toLight) + wrap) / (1.0 + wrap), 0.0, 1.0);
+
+    // ④ Blinn-Phong 高光
+    //
+    //   halfVec = 光源方向和视线方向的中间向量（半程向量）
+    //   NdotH 越大（法线越接近半程向量）→ 高光越强
+    //   pow(..., 32) 控制高光的锐利程度，越大越集中
+    vec3  viewDir = vec3(0.0, 0.0, 1.0);         // 正交相机，视线方向固定朝 Z
+    vec3  halfVec = normalize(toLight + viewDir);
+    float spec    = pow(max(dot(normal, halfVec), 0.0), 32.0) * uSpecular;
+
+    // ⑤ 阴影计算（由 uShadowMode 选择算法）
+    vec2  lightXY = uLightPos.xy;
+    vec2  dir2D   = lightXY - vUv;
+    float dist    = length(dir2D);
+    vec2  dir2Dn  = normalize(dir2D);
+
+    float shadow = 1.0;
+
+    if (uShadowMode == 0) {
+      // ── 模式0：无阴影 ────────────────────────────────
+      // 不做任何处理，shadow 保持 1.0
+      shadow = 1.0;
+
+    } else if (uShadowMode == 1) {
+      // ── 模式1：距离衰减 ──────────────────────────────
+      // 不检查遮挡，只让光随距离平方衰减
+      // 对单体立绘最实用：没有多物体投影，衰减就够了
+      //   attenuation = 1 / (1 + k·d²)
+      //   k 越大衰减越快；这里 k=4 是经验值，可以根据画面调
+      float attenuation = 1.0 / (1.0 + 4.0 * dist * dist);
+      shadow = mix(0.3, 1.0, attenuation); // 最暗保留 0.3，不全黑
+
+    } else if (uShadowMode == 2) {
+      // ── 模式2：硬阴影 ────────────────────────────────
+      // 只在光源方向采样一个点，深度更浅就判定为遮挡
+      // 结果是非 0 即 1 的硬边，像素风格游戏常用
+      vec2  probe  = vUv + dir2Dn * px * 4.0;
+      float pDepth = getDepth(probe);
+      shadow = (pDepth < depth - 0.02) ? 0.5 : 1.0;
+
+    } else if (uShadowMode == 3) {
+      // ── 模式3：Ray March 软阴影（当前经典方案）────────
+      // 从当前像素沿光源方向步进 16 步
+      // 每遇到一次遮挡就让 shadow 减少 0.04
+      // 多次遮挡叠加 → 边缘柔和渐变
+      // 缺点：步数固定，间隔均匀，容易出现条纹（Banding）
+      vec2  step = dir2Dn * px * 2.0;
+      vec2  cur  = vUv + step;
+      for (int i = 0; i < 16; i++) {
+        if (length(cur - vUv) >= dist) break;
+        if (getDepth(cur) < depth - 0.02) shadow -= 0.04;
+        cur += step;
+      }
+      shadow = clamp(shadow, 0.5, 1.0);
+
+    } else {
+      // ── 模式4：Ray March + 随机抖动（Jittered）────────
+      // 在步长里加一个伪随机偏移，打散均匀间隔
+      // 条纹变成随机噪点，视觉上比规则条纹更自然
+      //
+      // fract(sin(dot(uv, vec2(12.9898, 78.233))) * 43758.5)
+      //   这是经典的"哈希函数"：把 UV 坐标映射成 [0,1) 的伪随机数
+      //   每个像素得到不同的随机值，但同一像素每帧相同（无闪烁）
+      float jitter = fract(sin(dot(vUv, vec2(12.9898, 78.233))) * 43758.5453);
+      vec2  step   = dir2Dn * px * 2.0;
+      vec2  cur    = vUv + step * (0.5 + jitter * 0.5); // 起点随机偏移
+      for (int i = 0; i < 16; i++) {
+        if (length(cur - vUv) >= dist) break;
+        if (getDepth(cur) < depth - 0.02) shadow -= 0.04;
+        cur += step;
+      }
+      shadow = clamp(shadow, 0.5, 1.0);
+    }
+
+    // ⑥ 合成
+    //   light = 环境光 + (漫反射 + 高光) × 光强 × 阴影系数
+    //   原始颜色 × light → 亮的地方更亮，暗的地方乘以环境光保留细节
+    vec4  color = texture(uImage, vUv);  // WebGL1: texture2D(...)
+    float light = uAmbient + (diffuse + spec) * uIntensity * shadow;
+    fragColor   = vec4(color.rgb * light, color.a);  // WebGL1: gl_FragColor = ...
+  }
+`
+
+const uniforms = {
+  uImage:      { value: null },
+  uDepth:      { value: null },
+  uLightPos:   { value: lightPos },
+  uIntensity:  { value: 1.5 },
+  uSpecular:   { value: 0.4 },
+  uDepthScale: { value: 0.08 },
+  uAmbient:    { value: 0.2 },
+  uResolution: { value: new THREE.Vector2(512, 512) },
+  uShadowMode: { value: 3 },
+}
+
+const mat  = new THREE.ShaderMaterial({
+  vertexShader: vertShader, fragmentShader: fragShader,
+  uniforms, glslVersion: THREE.GLSL3,
+})
+scene.add(new THREE.Mesh(geo, mat))
+
+function resizeRenderer() {
+  const w = canvas.clientWidth
+  const h = canvas.clientHeight
+  if (canvas.width !== w || canvas.height !== h) {
+    renderer.setSize(w, h, false)
+    uniforms.uResolution.value.set(w, h)
+  }
+}
+
+;(function animate() {
+  requestAnimationFrame(animate)
+  resizeRenderer()
+  renderer.render(scene, camera)
+})()
+
+// mouse → light XY
+canvas.addEventListener('mousemove', e => {
+  const r = canvas.getBoundingClientRect()
+  lightPos.x =       (e.clientX - r.left) / r.width
+  lightPos.y = 1.0 - (e.clientY - r.top)  / r.height
+})
+
+// load image + depth → textures → show canvas
+function applyToLighting(imageSrc, depthSrc) {
+  const loader = new THREE.TextureLoader()
+
+  // load image: set canvas aspect ratio to match
+  const probe = new Image()
+  probe.onload = () => {
+    canvas.style.aspectRatio = `${probe.naturalWidth} / ${probe.naturalHeight}`
+    loader.load(imageSrc, tex => {
+      tex.flipY = true
+      uniforms.uImage.value = tex
+    })
+  }
+  probe.src = imageSrc
+
+  loader.load(depthSrc, tex => {
+    tex.flipY = true
+    uniforms.uDepth.value = tex
+
+    // show canvas, hide placeholder
+    $('lightingIdle').hidden = true
+    canvas.hidden = false
+    $('lightHint').hidden = false
+  })
+}
+
+// ── slider bindings ───────────────────────────────────
+function bindSlider(sliderId, valId, uniformKey, fmt = v => v) {
+  const s = $(sliderId), v = $(valId)
+  s.addEventListener('input', () => {
+    const val = parseFloat(s.value)
+    v.textContent = fmt(val)
+    uniforms[uniformKey].value = val
+  })
+}
+
+bindSlider('sIntensity',  'vIntensity',  'uIntensity',  v => v.toFixed(2))
+bindSlider('sSpecular',   'vSpecular',   'uSpecular',   v => v.toFixed(2))
+bindSlider('sDepthScale', 'vDepthScale', 'uDepthScale', v => v.toFixed(2))
+bindSlider('sAmbient',    'vAmbient',    'uAmbient',    v => v.toFixed(2))
+
+$('sShadowMode').addEventListener('change', e => {
+  uniforms.uShadowMode.value = parseInt(e.target.value)
+})
+
+$('sHeight').addEventListener('input', e => {
+  const val = parseFloat(e.target.value)
+  $('vHeight').textContent = val.toFixed(2)
+  lightPos.z = val
+})
+</script>
