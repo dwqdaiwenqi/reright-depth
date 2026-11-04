@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>pmndrs/denoiser 降噪 Demo</title>
+  <style>
+    body { font-family: -apple-system, "PingFang SC", sans-serif; background: #1e1e1e; color: #ddd; margin: 0; padding: 24px; }
+    h1 { font-size: 20px; }
+    .grid { display: flex; flex-wrap: wrap; gap: 20px; margin-top: 16px; }
+    figure { margin: 0; }
+    canvas { background: #000; display: block; border: 1px solid #444; width: 256px; height: 256px; }
+    figcaption { margin-top: 6px; font-size: 13px; color: #aaa; }
+    .ctl { margin: 12px 0; font-size: 14px; }
+    .ctl label { margin-right: 16px; }
+    button { padding: 4px 12px; }
+    #status { color: #8cf; margin-left: 12px; }
+    #err { color: #f66; white-space: pre-wrap; margin-top: 12px; }
+    code { background: #333; padding: 1px 4px; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <h1>pmndrs/denoiser 降噪 Demo</h1>
+  <p style="font-size:14px;color:#aaa;max-width:760px">
+    左边是用 "蒙特卡洛" 方式生成的噪点图（每个像素随机抽几个样本取平均，模拟磨砂反射）；
+    中间是把样本数加到很大得到的 "标准答案"；点 "降噪" 后，右边是 AI 降噪的结果。
+    用的是 npm 上的 <code>denoiser@0.0.11</code>（基于 TensorFlow.js 的 Intel OIDN 降噪网络，默认跑在 WebGL 上）。
+    需要联网：要从 CDN 下载库（体积较大，TensorFlow.js 在里面）和模型权重，第一次会比较慢。
+  </p>
+
+  <div class="ctl">
+    <label>每像素采样数 spp: <input id="spp" type="range" min="1" max="16" value="1"> <span id="sppVal">1</span></label>
+    <label>磨砂半径 radius: <input id="radius" type="range" min="1" max="20" value="8"> <span id="radiusVal">8</span></label>
+    <button id="regen">重新生成噪点</button>
+    <button id="run">降噪</button>
+    <span id="status"></span>
+  </div>
+  <div id="err"></div>
+
+  <div class="grid">
+    <figure><canvas id="noisyCanvas" width="256" height="256"></canvas><figcaption>噪点图（样本太少）</figcaption></figure>
+    <figure><canvas id="denoisedCanvas" width="256" height="256"></canvas><figcaption>AI 降噪后</figcaption></figure>
+    <figure><canvas id="cleanCanvas" width="256" height="256"></canvas><figcaption>标准答案（很多样本）</figcaption></figure>
+  </div>
+
+<script type="module">
+/*
+ * 这个页面做了三件事：
+ *   ① 用 "蒙特卡洛" 的方式生成一张噪点图：
+ *        有一张 "真实图案"（棋盘格背景 + 红圆 + 蓝方块 + 绿环），
+ *        磨砂效果 = 每个像素应该是它周围一圈区域的平均颜色（相当于一个模糊）。
+ *        我们不去算整圈的平均，而是在这一圈里随机抽几个点，把它们的颜色平均 —— 这就是蒙特卡洛。
+ *        样本越少，结果越嘈杂。
+ *   ② 用同样的方法抽很多样本，得到几乎没有噪点的 "标准答案"，用来对比。
+ *   ③ 调用 denoiser 库（npm 上的 0.0.11 旧版）把噪点图降噪，显示结果。
+ *
+ * 降噪库的用法其实就两步：
+ *   const denoiser = new Denoiser("webgl");            // 创建，参数是计算后端
+ *   const clean = await denoiser.execute(noisyCanvas); // 传入噪点图（第一次会下载权重），返回降噪后的 ImageData
+ */
+
+// =====================================================================
+//  配置：降噪库从哪里加载
+// =====================================================================
+// npm 上的 "denoiser" 包目前最新是 0.0.11（旧版，基于 TensorFlow.js，由 Dennis Smolek 开发）。
+// 新的 WebGPU 版（v2）还没有发布到 npm，所以这里用 0.0.11。
+// 库文件和模型权重已经下载到本地（vendor/denoiser/），不再从网上加载：
+//   vendor/denoiser/index.mjs  —— 库本身（TensorFlow.js 已经打包在里面）
+//   vendor/denoiser/tzas/*.tza —— OIDN 的权重文件（库默认从 jsDelivr 下载，这里改成读本地）
+// 想改回从网上加载：DENOISER_URL 用 "https://esm.sh/denoiser@0.0.11"，并删掉 weightsUrl 那一行
+const DENOISER_URL = "./vendor/denoiser/index.mjs";
+// 权重地址必须是完整的绝对地址：库内部会用 new URL(地址) 解析文件名，相对路径会报 "Invalid URL"
+const DENOISER_WEIGHTS_URL = new URL("./vendor/denoiser/tzas", location.href).href;
+
+// 计算后端：'webgl'（默认，兼容性最好）或 'webgpu'（需要浏览器支持 WebGPU，可能更快）
+const BACKEND = "webgl";
+
+const errBox = document.getElementById("err");
+const statusEl = document.getElementById("status");
+function showError(msg) { errBox.textContent += msg + "\n"; }
+
+// =====================================================================
+//  第一部分：生成噪点图（蒙特卡洛）
+// =====================================================================
+
+const W = 256, H = 256;
+
+// "真实图案"：给一个坐标 (x, y)，返回这个位置的颜色 [r, g, b]（范围 0~1）
+// 它是一个确定的函数，没有任何随机
+function pattern(x, y) {
+  // 红色圆盘：圆心 (90,100)，半径 45
+  if ((x - 90) * (x - 90) + (y - 100) * (y - 100) < 45 * 45) return [0.9, 0.15, 0.15];
+  // 蓝色方块
+  if (x > 150 && x < 220 && y > 60 && y < 190) return [0.15, 0.3, 0.9];
+  // 绿色圆环：圆心 (128,200)，半径 20~30 之间
+  const d2 = (x - 128) * (x - 128) + (y - 205) * (y - 205);
+  if (d2 > 20 * 20 && d2 < 30 * 30) return [0.2, 0.8, 0.3];
+  // 背景：32 像素一格的棋盘
+  const checker = (Math.floor(x / 32) + Math.floor(y / 32)) % 2 === 0;
+  return checker ? [0.85, 0.85, 0.85] : [0.2, 0.2, 0.2];
+}
+
+// 蒙特卡洛渲染：每个像素在 "磨砂半径" 范围内随机抽 spp 个点，取颜色的平均
+//   spp：每像素样本数
+//   radius：磨砂半径（像素）。想象每个像素 "看到" 的是周围 radius 范围内的平均颜色
+function renderMonteCarlo(canvas, spp, radius) {
+  const ctx = canvas.getContext("2d");
+  const img = ctx.createImageData(W, H);
+  const px = img.data;
+  let i = 0;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      let r = 0, g = 0, b = 0;
+      for (let k = 0; k < spp; k++) {
+        // 在以当前像素为中心、边长 2*radius 的方形范围内随机取一个点
+        const sx = x + (Math.random() * 2 - 1) * radius;
+        const sy = y + (Math.random() * 2 - 1) * radius;
+        const c = pattern(sx, sy);
+        r += c[0]; g += c[1]; b += c[2];
+      }
+      // 平均值：除以样本数
+      px[i++] = (r / spp) * 255;
+      px[i++] = (g / spp) * 255;
+      px[i++] = (b / spp) * 255;
+      px[i++] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+// 生成噪点图和标准答案
+function regenerate() {
+  const spp = +document.getElementById("spp").value;
+  const radius = +document.getElementById("radius").value;
+  renderMonteCarlo(document.getElementById("noisyCanvas"), spp, radius);
+  // 标准答案：同样的磨砂半径，但抽 256 个样本，噪点基本看不见
+  renderMonteCarlo(document.getElementById("cleanCanvas"), 256, radius);
+  // 噪点图换了，之前的降噪结果就过时了，清空
+  const dctx = document.getElementById("denoisedCanvas").getContext("2d");
+  dctx.clearRect(0, 0, W, H);
+  statusEl.textContent = "";
+}
+
+// =====================================================================
+//  第二部分：加载降噪库并降噪
+// =====================================================================
+
+let denoiser = null;   // 创建一次，之后重复使用
+
+async function getDenoiser() {
+  if (denoiser) return denoiser;
+
+  if (BACKEND === "webgpu" && !navigator.gpu) {
+    throw new Error("当前浏览器不支持 WebGPU（navigator.gpu 不存在），请把 BACKEND 改成 'webgl'。");
+  }
+
+  statusEl.textContent = "正在加载降噪库（含 TensorFlow.js，比较大）…";
+  // 动态 import：加载失败时可以捕获错误并显示出来
+  const mod = await import(DENOISER_URL);
+  const Denoiser = mod.Denoiser;
+  if (!Denoiser) throw new Error("库加载成功但没有找到 Denoiser 导出，请检查 DENOISER_URL。");
+
+  // 创建降噪器：旧版是直接 new，参数是计算后端的名字
+  denoiser = new Denoiser(BACKEND);
+  denoiser.weightsUrl = DENOISER_WEIGHTS_URL;   // 权重从本地读取
+
+  // 质量档位：'fast'（默认，网络最小）、'balanced'、'high'（最慢，效果最好）
+  denoiser.quality = "balanced";
+  // 输入是 8 位的 LDR 图（canvas 里的图），所以 hdr 保持 false（默认就是 false）。
+  // srgb 默认 false。如果降噪后颜色看起来偏暗或偏亮，可以试着改成 true
+  denoiser.srgb = false;
+
+  return denoiser;
+}
+
+async function runDenoise() {
+  errBox.textContent = "";
+  try {
+    const d = await getDenoiser();
+
+    const noisyCanvas = document.getElementById("noisyCanvas");
+
+    statusEl.textContent = "降噪中…（第一次会下载模型权重并构建网络，比较慢）";
+    const t0 = performance.now();
+
+    // 核心调用：execute(噪点图) 返回降噪后的 ImageData
+    // 输入可以是 canvas / ImageData / img 元素（库内部用 tf.browser.fromPixels 读取）
+    // 库会根据输入的宽高自动设置网络的尺寸
+    const clean = await d.execute(noisyCanvas);
+
+    // 把结果画到右边的 canvas
+    document.getElementById("denoisedCanvas").getContext("2d").putImageData(clean, 0, 0);
+    statusEl.textContent = "降噪完成，耗时 " + (performance.now() - t0).toFixed(0) + " ms";
+  } catch (e) {
+    statusEl.textContent = "";
+    showError("出错了：" + (e && e.message ? e.message : e));
+    console.error(e);
+  }
+}
+
+// =====================================================================
+//  第三部分：页面交互
+// =====================================================================
+document.getElementById("spp").oninput = function() {
+  document.getElementById("sppVal").textContent = this.value;
+  regenerate();
+};
+document.getElementById("radius").oninput = function() {
+  document.getElementById("radiusVal").textContent = this.value;
+  regenerate();
+};
+document.getElementById("regen").onclick = regenerate;
+document.getElementById("run").onclick = runDenoise;
+
+regenerate();
+</script>
+</body>
+</html>

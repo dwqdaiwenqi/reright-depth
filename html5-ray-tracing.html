@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!-- <title>JavaScript 光线追踪 Demo</title> -->
+  <style>
+    body { font-family: -apple-system, "PingFang SC", sans-serif; background: #1e1e1e; color: #ddd; margin: 0; padding: 24px; }
+    h1 { font-size: 20px; }
+    .grid { display: flex; flex-wrap: wrap; gap: 20px; }
+    figure { margin: 0; }
+    canvas { background: #000; display: block; border: 1px solid #444; }
+    figcaption { margin-top: 6px; font-size: 13px; color: #aaa; }
+    .ctl { margin: 12px 0 20px; font-size: 14px; }
+    .ctl label { margin-right: 16px; }
+    #time { color: #8cf; }
+  </style>
+</head>
+<body>
+  <!-- <h1>JavaScript 光线追踪 Demo</h1> -->
+
+  <div class="ctl">
+    <label>反射次数 maxReflect: <input id="maxReflect" type="range" min="0" max="6" value="3"> <span id="mrVal">3</span></label>
+    <label>FOV:<input id="fov" type="range" min="30" max="120" value="90"> <span id="fovVal">90</span></label>
+    <button id="redraw">重新渲染</button>
+    <span id="time"></span>
+  </div>
+
+  <div class="grid">
+    <figure><canvas id="depthCanvas" width="256" height="256"></canvas><figcaption>深度 (depth)</figcaption></figure>
+    <figure><canvas id="normalCanvas" width="256" height="256"></canvas><figcaption>法向量 (normal)</figcaption></figure>
+    <figure><canvas id="rayTraceCanvas" width="256" height="256"></canvas><figcaption>材质 (Phong + Checker)</figcaption></figure>
+    <figure><canvas id="rayTraceReflectionCanvas" width="256" height="256"></canvas><figcaption>反射 (reflection)</figcaption></figure>
+  </div>
+
+<script>
+// ---------- Vector3 ----------
+var Vector3 = function(x, y, z) { this.x = x; this.y = y; this.z = z; };
+Vector3.prototype = {
+  copy: function() { return new Vector3(this.x, this.y, this.z); },
+  length: function() { return Math.sqrt(this.x * this.x + this.y * this.y + this.z * this.z); },
+  sqrLength: function() { return this.x * this.x + this.y * this.y + this.z * this.z; },
+  normalize: function() { var inv = 1 / this.length(); return new Vector3(this.x * inv, this.y * inv, this.z * inv); },
+  negate: function() { return new Vector3(-this.x, -this.y, -this.z); },
+  add: function(v) { return new Vector3(this.x + v.x, this.y + v.y, this.z + v.z); },
+  subtract: function(v) { return new Vector3(this.x - v.x, this.y - v.y, this.z - v.z); },
+  multiply: function(f) { return new Vector3(this.x * f, this.y * f, this.z * f); },
+  divide: function(f) { var invf = 1 / f; return new Vector3(this.x * invf, this.y * invf, this.z * invf); },
+  dot: function(v) { return this.x * v.x + this.y * v.y + this.z * v.z; },
+  cross: function(v) { return new Vector3(-this.z * v.y + this.y * v.z, this.z * v.x - this.x * v.z, -this.y * v.x + this.x * v.y); }
+};
+Vector3.zero = new Vector3(0, 0, 0);
+
+// ---------- Ray ----------
+var Ray3 = function(origin, direction) { this.origin = origin; this.direction = direction; };
+Ray3.prototype = {
+  getPoint: function(t) { return this.origin.add(this.direction.multiply(t)); }
+};
+
+// ---------- IntersectResult ----------
+var IntersectResult = function() {
+  this.geometry = null;
+  this.distance = 0;
+  this.position = Vector3.zero;
+  this.normal = Vector3.zero;
+};
+IntersectResult.noHit = new IntersectResult();
+
+// ---------- Sphere ----------
+// 球体：由球心 center 和半径 radius 定义（只考虑表面）
+//
+// 求交原理：光线 x = o + t·d，球面 |x - c|² = r²。令 v = o - c，代入得
+//   t² + 2(d·v)·t + (v·v - r²) = 0        （d 是单位向量，所以 t² 系数为 1）
+//   t = -(d·v) ± sqrt( (d·v)² - (v·v - r²) )
+// 根号内（判别式）< 0 无交点；否则取较小的根（负号）即最近交点。
+var Sphere = function(center, radius) { this.center = center; this.radius = radius; };
+Sphere.prototype = {
+  // 复制一个球体
+  copy: function() { return new Sphere(this.center.copy(), this.radius); },
+
+  // 预计算半径的平方，求交时要反复用，避免每条光线都重新乘一次
+  initialize: function() { this.sqrRadius = this.radius * this.radius; },
+
+  // 求光线 ray 与球体的最近交点
+  intersect: function(ray) {
+    // v = 光线起点 - 球心：从球心指向光线起点的向量
+    var v = ray.origin.subtract(this.center);
+
+    // a0 = v·v - r²：二次方程的常数项
+    // 同时也能判断起点位置：>0 在球外，<0 在球内
+    var a0 = v.sqrLength() - this.sqrRadius;
+
+    // d·v：二次方程一次项系数的一半
+    var DdotV = ray.direction.dot(v);
+
+    // 快速剔除：DdotV > 0 说明光线方向和 "球心→起点" 同向，
+    // 即光线在远离球心，球在身后，不可能打中。
+    // 先做这个便宜的判断，可以省掉后面昂贵的 sqrt。
+    // （局限：默认起点在球外；起点在球内时这里会漏掉交点，做折射时需要改）
+    if (DdotV <= 0) {
+      // 判别式 = (d·v)² - (v·v - r²)
+      var discr = DdotV * DdotV - a0;
+
+      // 判别式 >= 0 才有实数解，也就是光线和球面相交
+      if (discr >= 0) {
+        var result = new IntersectResult();
+        result.geometry = this;                            // 记录打中了哪个物体
+        result.distance = -DdotV - Math.sqrt(discr);       // 取较小的根 = 最近交点的距离 t
+        result.position = ray.getPoint(result.distance);   // 交点坐标 = o + t·d
+        // 球面法线 = 球心指向交点的方向，归一化成单位向量
+        result.normal = result.position.subtract(this.center).normalize();
+        return result;
+      }
+    }
+
+    // 没打中，返回共用的 "无交点" 对象（geometry 为 null）
+    return IntersectResult.noHit;
+  }
+};
+
+// ---------- Plane ----------
+var Plane = function(normal, d) { this.normal = normal; this.d = d; };
+Plane.prototype = {
+  copy: function() { return new Plane(this.normal.copy(), this.d); },
+  initialize: function() { this.position = this.normal.multiply(this.d); },
+  intersect: function(ray) {
+    var a = ray.direction.dot(this.normal);
+    if (a >= 0) return IntersectResult.noHit;
+    var b = this.normal.dot(ray.origin.subtract(this.position));
+    var result = new IntersectResult();
+    result.geometry = this;
+    result.distance = -b / a;
+    result.position = ray.getPoint(result.distance);
+    result.normal = this.normal;
+    return result;
+  }
+};
+
+// ---------- Union ----------
+var Union = function(geometries) { this.geometries = geometries; };
+Union.prototype = {
+  initialize: function() {
+    for (var i = 0; i < this.geometries.length; i++) this.geometries[i].initialize();
+  },
+  intersect: function(ray) {
+    var minDistance = Infinity;
+    var minResult = IntersectResult.noHit;
+    for (var i = 0; i < this.geometries.length; i++) {
+      var result = this.geometries[i].intersect(ray);
+      if (result.geometry && result.distance < minDistance) {
+        minDistance = result.distance;
+        minResult = result;
+      }
+    }
+    return minResult;
+  }
+};
+
+// ---------- Camera ----------
+// 透视摄影机：所有光线从同一点 eye 出发，穿过影像平面上的取样点，产生近大远小的效果
+// eye：视点位置；front：朝向（单位向量）；up：参考上方向（通常 (0,1,0)）；fov：视野角度（度）
+//
+// 想象在摄影机正前方 1 个单位处放一块影像平面：
+//   - 平面中心 = eye + front
+//   - 平面宽高 = 2·tan(fov/2)（fov 同时是水平和垂直视野）
+// 取样点 (x,y) 在平面上的位置 = front + right·(偏移) + up·(偏移)，光线方向就是 eye 指向该点
+var PerspectiveCamera = function(eye, front, up, fov) { 
+  this.eye = eye; 
+  this.front = front; 
+  this.refUp = up; 
+  this.fov = fov;
+};
+PerspectiveCamera.prototype = {
+  // 预计算摄影机的三个坐标轴和视野缩放，每次渲染前调用一次
+  initialize: function() {
+    // right = front × refUp：叉乘得到同时垂直于两者的向量，即向右的方向
+    this.right = this.front.cross(this.refUp);
+    // up = right × front：重新算出真正垂直于 front 的上方向
+    // 为什么不直接用 refUp？因为用户给的 up 不一定和 front 垂直（例如摄影机俯视时）
+    this.up = this.right.cross(this.front);
+    // 影像平面的边长 = 2·tan(fov/2)
+    // 角度要先转弧度（× π/180）；这里把 "×2" 提前算好，generateRay 里就不用每次乘
+    this.fovScale = Math.tan(this.fov * 0.5 * Math.PI / 180) * 2;
+  },
+
+  // 根据取样坐标 (x,y) 生成光线，x、y 范围 [0,1]，左下角 (0,0)，右上角 (1,1)
+  generateRay: function(x, y) {
+    // 把 [0,1] 平移成 [-0.5,0.5]（中心为 0），再乘平面边长，得到离平面中心的横向偏移量
+    // 最终 r 是沿 right 方向的向量；左边为负，右边为正
+    var r = this.right.multiply((x - 0.5) * this.fovScale);
+    // 纵向同理，u 是沿 up 方向的向量
+    var u = this.up.multiply((y - 0.5) * this.fovScale);
+    // 方向 = front + r + u（影像平面上该点的位置，相对 eye）
+    // 光线方向需要是单位向量（Sphere/Plane 的求交公式依赖这一点），所以要 normalize
+    return new Ray3(this.eye, this.front.add(r).add(u).normalize());
+  }
+};
+
+// ---------- Color ----------
+var Color = function(r, g, b) { this.r = r; this.g = g; this.b = b; };
+Color.prototype = {
+  copy: function() { return new Color(this.r, this.g, this.b); },
+  add: function(c) { return new Color(this.r + c.r, this.g + c.g, this.b + c.b); },
+  multiply: function(s) { return new Color(this.r * s, this.g * s, this.b * s); },
+  modulate: function(c) { return new Color(this.r * c.r, this.g * c.g, this.b * c.b); }
+};
+Color.black = new Color(0, 0, 0);
+Color.white = new Color(1, 1, 1);
+Color.red = new Color(1, 0, 0);
+Color.green = new Color(0, 1, 0);
+Color.blue = new Color(0, 0, 1);
+
+// ---------- Materials ----------
+// reflectiveness：反射度 [0,1]，0 = 不反射，1 = 完全镜面；不传则为 0
+var CheckerMaterial = function(scale, reflectiveness) { this.scale = scale; this.reflectiveness = reflectiveness || 0; };
+CheckerMaterial.prototype = {
+  sample: function(ray, position, normal) {
+    // 原文这里 x 方向写死了 0.1，改为统一使用 scale
+    return Math.abs((Math.floor(position.x * this.scale) + Math.floor(position.z * this.scale)) % 2) < 1 ? Color.black : Color.white;
+  }
+};
+
+// 临时全局光源
+var lightDir = new Vector3(1, 1, 1).normalize();
+var lightColor = Color.white;
+
+var PhongMaterial = function(diffuse, specular, shininess, reflectiveness) {
+  this.diffuse = diffuse;
+  this.specular = specular;
+  this.shininess = shininess;
+  this.reflectiveness = reflectiveness || 0; // 反射度，不传则为 0
+};
+PhongMaterial.prototype = {
+  sample: function(ray, position, normal) {
+    var NdotL = normal.dot(lightDir);
+    var H = lightDir.subtract(ray.direction).normalize();
+    var NdotH = normal.dot(H);
+    var diffuseTerm = this.diffuse.multiply(Math.max(NdotL, 0));
+    var specularTerm = this.specular.multiply(Math.pow(Math.max(NdotH, 0), this.shininess));
+    return lightColor.modulate(diffuseTerm.add(specularTerm));
+  }
+};
+
+// ---------- Render helpers ----------
+function prepare(canvas) {
+  var ctx = canvas.getContext("2d");
+  var w = canvas.width, h = canvas.height;
+  ctx.fillStyle = "rgb(0,0,0)";
+  ctx.fillRect(0, 0, w, h);
+  var imgdata = ctx.getImageData(0, 0, w, h);
+  return { ctx: ctx, w: w, h: h, imgdata: imgdata, pixels: imgdata.data };
+}
+
+// 深度图：离摄影机越近越白，越远越黑，没打到物体的像素保持黑色
+// maxDepth：距离达到该值（或更远）时显示为纯黑
+function renderDepth(canvas, scene, camera, maxDepth) {
+  // 取得 canvas 的像素数组 pixels（一维，每 4 个元素 = 一个像素的 R,G,B,A）
+  var c = prepare(canvas), pixels = c.pixels;
+
+  // 预计算：球体算半径平方、摄影机算 right/up/fovScale 等，避免每条光线重复计算
+  scene.initialize();
+  camera.initialize();
+
+  var i = 0; // 当前像素在 pixels 里的下标，每处理一个像素前进 4
+  for (var y = 0; y < c.h; y++) {          // 从上到下逐行
+    // 屏幕 y 向下增长，但取样坐标要求左下角为(0,0)，所以要翻转
+    var sy = 1 - y / c.h;
+    for (var x = 0; x < c.w; x++) {        // 从左到右逐列
+      // 把像素位置归一化到 [0,1] 的取样坐标 (sx, sy)，由摄影机生成一条穿过该点的光线
+      var ray = camera.generateRay(x / c.w, sy);
+
+      // 求光线与场景中所有物体的最近交点
+      var result = scene.intersect(ray);
+
+      if (result.geometry) { // geometry 不为 null 表示打中了物体
+        // // 把距离 [0, maxDepth] 线性映射到灰度 [255, 0]：
+        // // 距离/maxDepth 得到 0~1，乘 255 后用 Math.min 封顶，再用 255 减去，使近处为白
+        var depth = 255 - Math.min((result.distance / maxDepth) * 255, 255);
+        // // R、G、B 同值即灰色，alpha=255 不透明
+        // pixels[i] = depth; pixels[i + 1] = depth; pixels[i + 2] = depth; pixels[i + 3] = 255;
+
+        pixels[i] = depth; 
+        pixels[i + 1] = depth; 
+        pixels[i + 2] = depth; 
+        pixels[i + 3] = 255;
+      }
+      // 没打中：保持 prepare() 填好的黑色背景，不用处理
+      i += 4; // 跳到下一个像素
+    }
+  }
+
+  // 把修改后的像素数组写回 canvas，图像才会显示出来
+  c.ctx.putImageData(c.imgdata, 0, 0);
+}
+
+// 法向量图：把交点处的法向量 (x,y,z) 直接当作颜色 (r,g,b) 显示，用于调试
+// 法向量是单位向量，每个分量范围 [-1, 1]，要映射到颜色范围 [0, 255]
+// 例：球体正上方法线 (0,1,0) → 颜色 (127.5, 255, 127.5)，是浅绿色
+function renderNormal(canvas, scene, camera) {
+  // 取得 canvas 的像素数组（一维，每 4 个元素 = 一个像素的 R,G,B,A）
+  var c = prepare(canvas), pixels = c.pixels;
+
+  // 预计算：球体算半径平方、摄影机算 right/up/fovScale 等
+  scene.initialize();
+  camera.initialize();
+
+  var i = 0; // 当前像素在 pixels 里的下标，每个像素前进 4
+  for (var y = 0; y < c.h; y++) {          // 从上到下逐行
+    // 屏幕 y 向下增长，取样坐标要求左下角为 (0,0)，所以翻转
+    var sy = 1 - y / c.h;
+    for (var x = 0; x < c.w; x++) {        // 从左到右逐列
+      // 像素位置归一化到 [0,1]，由摄影机生成穿过该点的光线
+      var ray = camera.generateRay(x / c.w, sy);
+
+      // 求光线与场景的最近交点
+      var result = scene.intersect(ray);
+
+      if (result.geometry) { // 打中了物体
+        // (n + 1) 把 [-1,1] 平移到 [0,2]，再乘 127.5 拉伸到 [0,255]
+        pixels[i]     = (result.normal.x + 1) * 127.5; // x → 红
+        pixels[i + 1] = (result.normal.y + 1) * 127.5; // y → 绿
+        pixels[i + 2] = (result.normal.z + 1) * 127.5; // z → 蓝
+        pixels[i + 3] = 255;                           // alpha 不透明
+      }
+      // 没打中：保持 prepare() 填好的黑色背景
+      i += 4; // 跳到下一个像素
+    }
+  }
+
+  // 把像素数组写回 canvas，图像才会显示
+  c.ctx.putImageData(c.imgdata, 0, 0);
+}
+
+// 光线追踪主流程：对每个像素发射一条光线，求最近交点，再向交点的材质要颜色
+// 和 renderDepth / renderNormal 的骨架完全一样，区别只在 "交点 → 颜色" 这一步
+function rayTrace(canvas, scene, camera) {
+  // 取得 canvas 的像素数组（一维，每 4 个元素 = 一个像素的 R,G,B,A）
+  var c = prepare(canvas), pixels = c.pixels;
+
+  // 预计算：几何体（球半径平方、平面位置）和摄影机（right/up/fovScale）
+  scene.initialize();
+  camera.initialize();
+
+  var i = 0; // 当前像素在 pixels 里的下标，每个像素前进 4
+  for (var y = 0; y < c.h; y++) {          // 从上到下逐行
+    // 屏幕 y 向下增长，取样坐标要求左下角为 (0,0)，所以翻转
+    var sy = 1 - y / c.h;
+    for (var x = 0; x < c.w; x++) {        // 从左到右逐列
+      // 第 1 步：摄影机生成穿过该像素的光线
+      var ray = camera.generateRay(x / c.w, sy);
+
+      // 第 2 步：求光线与场景的最近交点（Union 会在所有物体里挑最近的）
+      var result = scene.intersect(ray);
+
+      if (result.geometry) { // 打中了物体
+        // 第 3 步：让被打中物体的材质决定这一点的颜色
+        // 材质需要知道：入射光线方向（算高光）、交点位置（算格子）、法向量（算漫反射）
+        // 这里用到了多态：球和平面可以有不同材质，调用方式都是 material.sample(...)
+        var color = result.geometry.material.sample(ray, result.position, result.normal);
+
+        // 颜色通道范围是 [0,1]，写入像素要 [0,255]
+        pixels[i]     = color.r * 255;
+        pixels[i + 1] = color.g * 255;
+        pixels[i + 2] = color.b * 255;
+        pixels[i + 3] = 255; // alpha 不透明
+      }
+      // 没打中：保持 prepare() 填好的黑色背景
+      i += 4; // 跳到下一个像素
+    }
+  }
+
+  // 把像素数组写回 canvas，图像才会显示
+  c.ctx.putImageData(c.imgdata, 0, 0);
+}
+
+// ---------- Reflection ----------
+// 递归追踪一条光线的颜色；maxReflect 是还允许反射的次数，防止无限递归（如两面镜子对着）
+function rayTraceRecursive(scene, ray, maxReflect) {
+  var result = scene.intersect(ray);
+
+  // 没打中任何物体：背景黑色
+  if (!result.geometry) return Color.black;
+
+  var material = result.geometry.material;
+  var reflectiveness = material.reflectiveness;
+
+  // 物体自身颜色，只保留 (1 - 反射度) 的比例
+  var color = material.sample(ray, result.position, result.normal).multiply(1 - reflectiveness);
+
+  // 有反射度且还有反射次数：向反射方向继续追踪
+  if (reflectiveness > 0 && maxReflect > 0) {
+    // 反射向量 r = d - 2(d·n)n
+    // d·n 是 d 在法线上的投影长度（n 是单位向量），d 减去两倍的这个分量就是镜面反射方向
+    var r = result.normal.multiply(-2 * result.normal.dot(ray.direction)).add(ray.direction);
+
+    // 反射光线：起点是交点，方向是反射向量 r（和教程原文一致，不做偏移）
+    var reflectedColor = rayTraceRecursive(scene, new Ray3(result.position, r), maxReflect - 1);
+
+    // 例：反射度 25% → 75% 自身颜色 + 25% 反射回来的颜色
+    color = color.add(reflectedColor.multiply(reflectiveness));
+  }
+  return color;
+}
+
+// 带反射的渲染入口：和 rayTrace 的骨架一样，区别是 "求交 + 着色" 整个交给递归函数
+// 它自己只负责 "遍历像素 + 把颜色写进 canvas"，反射的逻辑都在 rayTraceRecursive 里
+// maxReflect：每条主光线最多允许反射几次
+function rayTraceReflection(canvas, scene, camera, maxReflect) {
+  // 取得 canvas 的像素数组（一维，每 4 个元素 = 一个像素的 R,G,B,A）
+  var c = prepare(canvas), pixels = c.pixels;
+
+  // 预计算：几何体和摄影机
+  scene.initialize();
+  camera.initialize();
+
+  var i = 0; // 当前像素在 pixels 里的下标
+  for (var y = 0; y < c.h; y++) {          // 从上到下逐行
+    // 屏幕 y 向下增长，取样坐标左下角为 (0,0)，所以翻转
+    var sy = 1 - y / c.h;
+    for (var x = 0; x < c.w; x++) {        // 从左到右逐列
+      // 摄影机生成穿过该像素的主光线
+      var ray = camera.generateRay(x / c.w, sy);
+
+      // 和 rayTrace 的区别在这里：
+      // rayTrace 是 "求交 → 问材质要颜色"，只算一层；
+      // 这里把主光线交给递归函数，它会求交、着色，并在需要时沿反射方向继续追踪，
+      // 最终返回 "自身颜色 + 反射回来的颜色" 混合后的结果
+      var color = rayTraceRecursive(scene, ray, maxReflect);
+
+      // 颜色通道 [0,1] → 像素 [0,255]
+      // 这里用 i++ 逐个写入并自动前进；没打中的像素递归函数返回 Color.black，
+      // 所以不需要像 rayTrace 那样判断 geometry，每个像素都写入
+      pixels[i++] = color.r * 255
+      pixels[i++] = color.g * 255;
+      pixels[i++] = color.b * 255;
+      pixels[i++] = 255; // alpha 不透明
+    }
+  }
+
+  // 把像素数组写回 canvas，图像才会显示
+  c.ctx.putImageData(c.imgdata, 0, 0);
+}
+
+// ---------- Scenes & wiring ----------
+function renderAll() {
+  var t0 = performance.now();
+  var fov = +document.getElementById("fov").value;
+  var V = function(x, y, z) { return new Vector3(x, y, z); };
+
+  // // 深度 / 法向量：单个球体
+  var single = new Sphere(V(0, 10, -10), 10);
+  var cam1 = new PerspectiveCamera(V(0, 10, 10), V(0, 0, -1), V(0, 1, 0), fov);
+  renderDepth(document.getElementById("depthCanvas"), single, cam1, 20);
+  renderNormal(document.getElementById("normalCanvas"), single, cam1);
+
+  // 材质：地板 + 两个球 (无反射)
+  // var plane = new Plane(V(0, 1, 0), 0);
+  var s1 = new Sphere(V(-10, 10, -10), 10);
+  // var s2 = new Sphere(V(10, 10, -10), 10);
+  // plane.material = new CheckerMaterial(0.1);
+  s1.material = new PhongMaterial(Color.red, Color.white, 16);
+  // s2.material = new PhongMaterial(Color.blue, Color.white, 16);
+  var cam2 = new PerspectiveCamera(V(0, 5, 15), V(0, 0, -1), V(0, 1, 0), fov);
+  rayTrace(document.getElementById("rayTraceCanvas"), new Union([ s1]), cam2);
+
+  // rayTrace(document.getElementById("rayTraceCanvas"), new Union([plane, s1,s2]), cam2);
+
+  // // 反射：地板 + 两个球，都带反射度
+  var maxReflect = +document.getElementById("maxReflect").value;
+  var plane2 = new Plane(V(0, 1, 0), 0);
+  var r1 = new Sphere(V(-10, 10, -10), 10);
+  var r2 = new Sphere(V(10, 10, -10), 10);
+  plane2.material = new CheckerMaterial(0.1, 0.5);
+  r1.material = new PhongMaterial(Color.red, Color.white, 16, 0.25);
+  r2.material = new PhongMaterial(Color.blue, Color.white, 16, 0.25);
+  var cam3 = new PerspectiveCamera(V(0, 5, 15), V(0, 0, -1), V(0, 1, 0), fov);
+  // rayTraceReflection(document.getElementById("rayTraceReflectionCanvas"), new Union([plane2, r1, r2]), cam3, maxReflect);
+
+  rayTraceReflection(document.getElementById("rayTraceReflectionCanvas"), new Union([plane2, r1]), cam3, maxReflect);  
+  // document.getElementById("time").textContent = "渲染耗时 " + (performance.now() - t0).toFixed(0) + " ms";
+}
+
+document.getElementById("maxReflect").oninput = function() { document.getElementById("mrVal").textContent = this.value; };
+document.getElementById("maxReflect").onchange = renderAll;
+document.getElementById("fov").oninput = function() { document.getElementById("fovVal").textContent = this.value; };
+document.getElementById("redraw").onclick = renderAll;
+document.getElementById("fov").onchange = renderAll;
+renderAll();
+</script>
+</body>
+</html>

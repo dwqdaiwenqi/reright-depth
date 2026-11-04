@@ -1,0 +1,960 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!-- <title>WebGL2 光线追踪 - 三角形版</title> -->
+  <style>
+    body { font-family: -apple-system, "PingFang SC", sans-serif; background: #1e1e1e; color: #ddd; margin: 0; padding: 24px; }
+    h1 { font-size: 20px; }
+    .grid { display: flex; flex-wrap: wrap; gap: 20px; }
+    figure { margin: 0; }
+    canvas { background: #000; display: block; border: 1px solid #444; }
+    figcaption { margin-top: 6px; font-size: 13px; color: #aaa; }
+    .ctl { margin: 12px 0 20px; font-size: 14px; }
+    .ctl label { margin-right: 16px; }
+    #err { color: #f66; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <!-- <h1>WebGL2 光线追踪 - 三角形版（无 BVH）</h1> -->
+
+  <div class="ctl">
+    <label>反射次数 maxReflect: <input id="maxReflect" type="range" min="0" max="6" value="3"> <span id="mrVal">3</span></label>
+    <label>磨砂程度 roughness: <input id="roughness" type="range" min="0" max="1" step="0.01" value="0.3"> <span id="roughVal">0.30</span></label>
+    <label>每像素采样数 spp: <input id="samples" type="range" min="1" max="64" value="1"> <span id="samplesVal">1</span></label>
+    <label>FOV: <input id="fov" type="range" min="30" max="120" value="90"> <span id="fovVal">90</span></label>
+    <label><input id="denoiseOn" type="checkbox"> 启用 AI 降噪（后台异步，第一次会下载库和模型）</label>
+    <span id="denoiseStatus" style="color:#8cf"></span>
+  </div>
+  <div id="err"></div>
+
+  <div class="grid">
+    <figure><canvas id="depthCanvas" width="256" height="256"></canvas><figcaption>深度 (depth)</figcaption></figure>
+    <figure><canvas id="normalCanvas" width="256" height="256"></canvas><figcaption>法向量 (normal)</figcaption></figure>
+    <figure><canvas id="rayTraceCanvas" width="256" height="256"></canvas><figcaption>材质 (Phong + Checker)</figcaption></figure>
+    <figure><canvas id="rayTraceReflectionCanvas" width="256" height="256"></canvas><figcaption>反射 (reflection)，磨砂反射有噪点</figcaption></figure>
+    <figure><canvas id="albedoCanvas" width="256" height="256"></canvas><figcaption>反照率 albedo（降噪辅助图）</figcaption></figure>
+    <figure><canvas id="auxNormalCanvas" width="256" height="256"></canvas><figcaption>法线 normal（降噪辅助图）</figcaption></figure>
+    <figure><canvas id="denoisedCanvas" width="256" height="256"></canvas><figcaption>AI 降噪后（比画面慢几帧）</figcaption></figure>
+  </div>
+
+<script>
+/*
+ * 和 webgl2.html 的区别：物体不再是 "球 / 平面" 这种解析几何体，而是 "三角形"
+ *
+ *   webgl2.html          : 球、平面 → 数学公式求交
+ *   webgl2-triangles.html: 一切都是三角形 → Möller–Trumbore 求交
+ *
+ * 场景：一个四边形（地板）+ 一个三角形（红）+ 一个四边形（蓝，立起来的墙）
+ *   GPU 只认三角形，所以四边形 = 两个三角形，一共 5 个三角形。
+ *
+ * 数据流（全是最传统的 uniform，没有纹理）：
+ *   ① CPU：用 addTriangle / addQuad 把物体拆成三角形，放进 JS 数组
+ *   ② CPU：把三角形的顶点、颜色等拆成几个数组，用 gl.uniform3fv / uniform4fv 等函数传给着色器
+ *   ③ GPU：着色器里用 uniform 数组接收，循环遍历每个三角形求交，保留最近的
+ *
+ * 限制：uniform 数组的大小有上限（这里最多 16 个三角形）。
+ * 三角形成千上万时，就要换别的办法存数据（比如纹理、缓冲），并加 BVH 加速结构。
+ * 本 demo 为了清晰都省略了：每个像素要和 "所有" 三角形求交。
+ */
+
+// 着色器里数组大小必须是常量，最多放这么多个三角形
+var MAX_TRIANGLES = 16;
+
+// =====================================================================
+//  第一部分：CPU 端建模——把物体拆成三角形
+// =====================================================================
+
+// 材质：phong / checker 两种，每个三角形各带一份
+//   kind：0 = phong，1 = checker
+//   param：phong 的 shininess，或 checker 的 scale
+//   kind：0 = phong，1 = checker，2 = 贴图（用 img.png 的颜色）
+//   reflectiveness：反射度 [0,1]，0 = 不反射，1 = 完全镜面；不传则为 0
+function PhongMaterial(diffuse, shininess, reflectiveness) {
+  return { kind: 0, diffuse: diffuse, param: shininess, reflectiveness: reflectiveness || 0 };
+}
+function CheckerMaterial(scale, reflectiveness) {
+  return { kind: 1, diffuse: [0, 0, 0], param: scale, reflectiveness: reflectiveness || 0 };
+}
+function ImageMaterial(reflectiveness) {
+  // 漫反射颜色从贴图里取；param 是高光指数 shininess
+  return { kind: 2, diffuse: [1, 1, 1], param: 32, reflectiveness: reflectiveness || 0 };
+}
+
+// 添加一个三角形：三个顶点 v0 v1 v2（各为 [x,y,z]）
+// uv0 uv1 uv2：三个顶点对应的贴图坐标 [u,v]（0~1，左下角 (0,0)，右上角 (1,1)）；不贴图的三角形可以不传
+function addTriangle(list, v0, v1, v2, material, uv0, uv1, uv2) {
+  list.push({
+    v0: v0, v1: v1, v2: v2, material: material,
+    uv0: uv0 || [0, 0], uv1: uv1 || [0, 0], uv2: uv2 || [0, 0]
+  });
+}
+
+// 添加一个四边形：四个顶点按顺序（a→b→c→d 绕一圈），拆成两个三角形 (a,b,c) 和 (a,c,d)
+// 贴图坐标：整张图铺满四边形，a=左下 (0,0)，b=右下 (1,0)，c=右上 (1,1)，d=左上 (0,1)
+// 所以顶点顺序要对应 "左下、右下、右上、左上"，图片才不会歪
+function addQuad(list, a, b, c, d, material) {
+  addTriangle(list, a, b, c, material, [0, 0], [1, 0], [1, 1]);
+  addTriangle(list, a, c, d, material, [0, 0], [1, 1], [0, 1]);
+}
+
+// =====================================================================
+//  第二部分：把三角形列表拆成 uniform 数组
+// =====================================================================
+
+// gl.uniform3fv 等函数需要一个 "拍平" 的数组：
+//   verts 数组 = [第0个三角形的 v0 的 x,y,z, 第0个三角形的 v1 的 x,y,z, 第0个三角形的 v2 的 x,y,z,
+//                 第1个三角形的 v0 的 x,y,z, ...]
+//   也就是每个三角形连续放 3 个顶点，每个顶点 3 个数，共 9 个 float
+function toUniformData(list) {
+  if (list.length > MAX_TRIANGLES) throw new Error("三角形太多了，最多 " + MAX_TRIANGLES + " 个");
+  var data = {
+    count: list.length,
+    verts: new Float32Array(MAX_TRIANGLES * 3 * 3),  // 每个三角形 3 个顶点，每个顶点 (x,y,z)
+    uvs: new Float32Array(MAX_TRIANGLES * 3 * 2),    // 每个三角形 3 个顶点，每个顶点贴图坐标 (u,v)
+    color: new Float32Array(MAX_TRIANGLES * 4),      // 漫反射颜色 r,g,b + 材质类型 kind
+    param: new Float32Array(MAX_TRIANGLES),          // 材质参数（shininess 或 scale）
+    refl: new Float32Array(MAX_TRIANGLES)            // 反射度
+  };
+  list.forEach(function(tri, i) {
+    data.verts.set(tri.v0, i * 9);       // 第 i 个三角形的第 1 个顶点放在 i*9
+    data.verts.set(tri.v1, i * 9 + 3);   // 第 2 个顶点紧跟在后面
+    data.verts.set(tri.v2, i * 9 + 6);   // 第 3 个顶点
+    data.uvs.set(tri.uv0, i * 6);        // 贴图坐标同理，每个三角形 6 个 float
+    data.uvs.set(tri.uv1, i * 6 + 2);
+    data.uvs.set(tri.uv2, i * 6 + 4);
+    data.color.set([tri.material.diffuse[0], tri.material.diffuse[1], tri.material.diffuse[2], tri.material.kind], i * 4);
+    data.param[i] = tri.material.param;
+    data.refl[i] = tri.material.reflectiveness;
+  });
+  return data;
+}
+
+// =====================================================================
+//  第三部分：着色器（GPU 端）
+// =====================================================================
+
+// ---------- 顶点着色器：从 VBO 读入顶点位置，画一个盖住全屏的三角形 ----------
+// aPos 是顶点属性（attribute），数据来自 VBO，location 0 要和 JS 里 vertexAttribPointer 的下标一致
+// 三个顶点是 (-1,-1) (3,-1) (-1,3)（裁剪空间坐标），超出屏幕的部分会被自动裁掉
+var VERT_SRC = /*glsl*/ `#version 300 es
+layout(location = 0) in vec2 aPos;
+void main() {
+  gl_Position = vec4(aPos, 0.0, 1.0);
+}`;
+
+// ---------- 片元着色器 ----------
+var FRAG_SRC = /*glsl*/ `#version 300 es
+precision highp float;
+
+#define MAX_TRIANGLES ${MAX_TRIANGLES}
+
+// ===== 三角形数据：从 JS 传进来的 uniform 数组 =====
+uniform int   uCount;                    // 实际有多少个三角形
+uniform vec3  uVerts[MAX_TRIANGLES * 3]; // 顶点位置：第 i 个三角形的三个顶点是 uVerts[i*3]、[i*3+1]、[i*3+2]
+uniform vec2  uUVs[MAX_TRIANGLES * 3];   // 贴图坐标：下标和 uVerts 一一对应
+uniform vec4  uColor[MAX_TRIANGLES];     // (漫反射 r,g,b, 材质类型 kind)，每个三角形一个
+uniform float uParam[MAX_TRIANGLES];     // 材质参数，每个三角形一个
+uniform float uRefl[MAX_TRIANGLES];      // 反射度，每个三角形一个（0 = 不反射）
+uniform int   uMaxReflect;               // 最多反射几次
+uniform float uRoughness;                // 磨砂程度：0 = 镜面，越大反射方向抖得越厉害
+uniform int   uSamples;                  // 每个像素采样几次（追踪几次，再取平均）
+uniform int   uFrame;                    // 当前是第几帧：每帧不同，让随机数每帧都变
+
+uniform sampler2D uImage;                // 贴图（img.png）
+
+uniform vec2  uRes;         // canvas 的宽高（像素）
+uniform float uFov;         // 视野角度（度）
+uniform vec3  uEye;         // 摄影机位置
+uniform int   uMode;        // 0=深度  1=法向量  2=材质/反射  3=反照率（降噪辅助）  4=法线（降噪辅助）
+
+out vec4 outColor;
+
+const float BIG = 1e20;     // 当作 "无穷远"
+const float EPS = 1e-4;    // 距离小于它的交点一律忽略，防止光线又打中自己出发的那个三角形
+
+// 临时全局光源，和之前一样
+const vec3 LIGHT_DIR   = vec3(0.57735027);   // normalize(1,1,1)
+const vec3 LIGHT_COLOR = vec3(1.0);
+
+// ===== 相交结果 =====
+struct Hit {
+  int   id;        // 打中了第几个三角形；-1 表示没打中
+  float distance;  // 光线上的距离 t
+  vec3  position;  // 交点位置
+  vec3  normal;    // 交点法向量
+  vec2  uv;        // 交点处的贴图坐标（由三个顶点的 uv 按重心坐标插值得到）
+};
+
+// ===== 三角形求交：Möller–Trumbore 算法 =====
+// 思路：交点可以写成 v0 + u·e1 + v·e2（u、v 是重心坐标，e1、e2 是两条边）
+//       同时又等于 o + t·d（光线上的点）。
+//       解这个三元一次方程组得到 (t, u, v)，用叉乘和点乘就能直接算出来（克莱姆法则）。
+//       只要 u>=0、v>=0、u+v<=1，交点就在三角形内部。
+// 返回一个 TriHit（和 JS 里返回一个对象一样）：有没有打中、距离 t、重心坐标 bu 和 bv
+// 重心坐标后面用来插值贴图坐标
+struct TriHit {
+  bool  hit;   // 有没有打中这个三角形
+  float t;     // 光线上的距离，交点 = o + d·t
+  float bu;    // 重心坐标 u
+  float bv;    // 重心坐标 v
+};
+
+TriHit hitTriangle(vec3 o, vec3 d, vec3 v0, vec3 v1, vec3 v2) {
+  TriHit r;                          // 先准备一个 "没打中" 的结果，中途 return r 就表示没打中
+  r.hit = false;
+  r.t = 0.0;
+  r.bu = 0.0;
+  r.bv = 0.0;
+
+  vec3 e1 = v1 - v0;                 // 边 1
+  vec3 e2 = v2 - v0;                 // 边 2
+  vec3 p = cross(d, e2);
+  float det = dot(e1, p);            // 行列式；接近 0 说明光线和三角形平行
+  if (abs(det) < 1e-8) return r;
+  float invDet = 1.0 / det;
+
+  vec3 s = o - v0;
+  float u = dot(s, p) * invDet;      // 重心坐标 u
+  if (u < 0.0 || u > 1.0) return r;
+
+  vec3 q = cross(s, e1);
+  float v = dot(d, q) * invDet;      // 重心坐标 v
+  if (v < 0.0 || u + v > 1.0) return r;
+
+  float t = dot(e2, q) * invDet;     // 光线上的距离
+  if (t <= EPS) return r;            // 交点必须在光线前方，且离起点足够远
+
+  // 全部通过：打中了，把结果填进去
+  r.hit = true;
+  r.t = t;
+  r.bu = u;
+  r.bv = v;
+  return r;
+}
+
+// ===== 场景求交：遍历所有三角形，保留最近的 =====
+// 没有 BVH，所以这里是最朴素的 "逐个测试"：每条光线要和每一个三角形都求一次交
+//
+// 什么是 BVH（Bounding Volume Hierarchy，包围体层级）？
+//   一种加速求交的树形结构。做法：
+//   1. 给每个三角形套一个简单的 "包围盒"（刚好装下它的长方体）
+//   2. 把相邻的包围盒再合并成更大的盒子，一层层往上合并，最后得到一棵二叉树：
+//        根节点：装下整个场景的大盒子
+//          ├─ 左子树：装下左边一半三角形的盒子
+//          └─ 右子树：装下右边一半三角形的盒子
+//              ... 一直分到叶子节点，叶子里只有几个三角形
+//   3. 光线求交时从根节点开始：先测光线和大盒子相不相交（测盒子很便宜）。
+//        没碰到盒子 → 盒子里所有三角形都不用测了，整棵子树直接跳过
+//        碰到盒子 → 再往下测它的两个子盒子，直到叶子，才真正测三角形
+//   效果：每条光线只需要测大约 log2(n) 个盒子加少量三角形，而不是全部 n 个。
+//        比如 100 万个三角形，逐个测要 100 万次，用 BVH 大约只要几十次。
+//
+// 为什么我们不用：现在场景只有 5 个三角形，逐个测只要 5 次，
+//   建树和遍历的代码反而更复杂、更慢。三角形上千以后才值得加 BVH。
+Hit intersectScene(vec3 o, vec3 d) {
+  Hit best;
+  best.id = -1;
+  best.distance = BIG;
+  best.position = vec3(0.0);
+  best.normal = vec3(0.0);
+  best.uv = vec2(0.0);
+
+  for (int i = 0; i < MAX_TRIANGLES; i++) {
+    if (i >= uCount) break;                 // 只处理 JS 实际传进来的三角形
+
+    // 取出第 i 个三角形的三个顶点（每个三角形在数组里连续占 3 个位置）
+    vec3 v0 = uVerts[i * 3];
+    vec3 v1 = uVerts[i * 3 + 1];
+    vec3 v2 = uVerts[i * 3 + 2];
+
+    TriHit h = hitTriangle(o, d, v0, v1, v2);   // 得到一个结果对象：h.hit、h.t、h.bu、h.bv
+    if (h.hit && h.t < best.distance) {
+      best.id = i;
+      best.distance = h.t;
+      best.position = o + d * h.t;
+
+      // 贴图坐标插值：交点 = (1-u-v)·v0 + u·v1 + v·v2，贴图坐标用同样的权重混合三个顶点的 uv
+      best.uv = (1.0 - h.bu - h.bv) * uUVs[i * 3] + h.bu * uUVs[i * 3 + 1] + h.bv * uUVs[i * 3 + 2];
+
+      // 法线：两条边的叉乘垂直于三角形所在平面（球的法线靠球心算；三角形靠叉乘）
+      vec3 n = normalize(cross(v1 - v0, v2 - v0));
+      // 三角形有正反两面，叉乘的方向取决于顶点顺序（绕向）。
+      // 这里让法线总是朝向光线射来的一侧，这样顶点顺序随便写都行（双面）
+      if (dot(n, d) > 0.0) n = -n;
+      best.normal = n;
+    }
+  }
+  return best;
+}
+
+// ===== 材质 =====
+
+// 格子的底色（黑或白），不含光照。反照率图和带阴影的格子材质都用它
+vec3 checkerColor(vec3 position, float scale) {
+  return mod(floor(position.x * scale) + floor(position.z * scale), 2.0) < 1.0
+    ? vec3(0.0) : vec3(1.0);
+}
+
+// ===== 阴影 =====
+// 原理：从交点向光源方向再发一条光线（叫 "阴影光线"），看途中有没有被别的东西挡住：
+//   挡住了 → 这个点照不到光，在阴影里
+//   没挡住 → 这个点被光照到
+// 这正是光线追踪天然能做阴影的原因：求交函数 intersectScene 本来就能回答 "这条光线先碰到什么"。
+// LIGHT_DIR 是 "指向光源的方向"（平行光，所以不用管光源有多远，只要射线不被挡住就算照到）
+// 返回 1.0 = 被光照到，0.0 = 在阴影里
+float lightVisibility(vec3 position, vec3 normal) {
+  // 表面背对着光源：本来就照不到，不用再发阴影光线
+  if (dot(normal, LIGHT_DIR) <= 0.0) return 0.0;
+  // 从交点往光源方向发一条光线。起点就在表面上，hitTriangle 里的 EPS 会忽略掉离起点太近的交点，
+  // 所以不会被自己所在的那个三角形挡住
+  Hit s = intersectScene(position, LIGHT_DIR);
+  return s.id >= 0 ? 0.0 : 1.0;      // 打中了任何东西 = 光被挡住
+}
+
+// 环境光：在阴影里并不是纯黑（现实中阴影里还有来自四周的反射光），给一个很小的底亮度
+const float AMBIENT = 0.25;
+
+// 格子材质（本身没有光照公式，这里只用阴影系数调亮度：被照到是原色，在阴影里变暗）
+vec3 checker(vec3 position, float scale, float lit) {
+  return checkerColor(position, scale) * (AMBIENT + (1.0 - AMBIENT) * lit);
+}
+
+// Phong 材质，高光颜色固定为白色
+// lit：光照可见度，1 = 被光照到，0 = 在阴影里。阴影里只剩环境光，没有漫反射和高光
+vec3 phong(vec3 diffuse, float shininess, vec3 dir, vec3 normal, float lit) {
+  float NdotL = dot(normal, LIGHT_DIR);
+  vec3 H = normalize(LIGHT_DIR - dir);                // 半角向量
+  float NdotH = dot(normal, H);
+  vec3 diffuseTerm  = diffuse * max(NdotL, 0.0);
+  vec3 specularTerm = vec3(1.0) * pow(max(NdotH, 0.0), shininess);
+  vec3 ambientTerm  = diffuse * AMBIENT;              // 环境光：不管有没有被照到都有
+  return ambientTerm + lit * LIGHT_COLOR * (diffuseTerm + specularTerm);   // 直接光乘上 lit：在阴影里就被关掉
+}
+
+// 取得交点处的颜色：按被打中三角形的编号，从 uniform 数组里取它的材质
+vec3 shade(Hit h, vec3 dir) {
+  vec4 c = uColor[h.id];          // (diffuse.rgb, kind)
+  float param = uParam[h.id];     // 材质参数
+
+  // 先判断这个点有没有被光照到（发一条阴影光线）。三种材质共用这个结果
+  float lit = lightVisibility(h.position, h.normal);
+
+  if (c.w < 0.5) {
+    return phong(c.rgb, param, dir, h.normal, lit);   // kind 0：phong，param = shininess
+  }
+  if (c.w < 1.5) {
+    return checker(h.position, param, lit);           // kind 1：checker，param = scale
+  }
+  // kind 2：贴图 + 光照。
+  // 用插值出来的 uv 去图片里取颜色，把它当作 Phong 的漫反射颜色，再套上光照：
+  // 面向光源的一侧亮，背向光源的一侧变暗，转动时就能看到明暗变化
+  vec3 texColor = texture(uImage, h.uv).rgb;
+  return phong(texColor, param, dir, h.normal, lit);
+}
+
+// 反照率（albedo）：物体本来的颜色，不含光照和反射。AI 降噪用它来分辨哪里是纹理细节、哪里是噪点
+vec3 albedo(Hit h) {
+  vec4 c = uColor[h.id];
+  if (c.w < 0.5) return c.rgb;                          // phong：漫反射颜色
+  if (c.w < 1.5) return checkerColor(h.position, uParam[h.id]);   // 格子（不含光照和阴影）
+  return texture(uImage, h.uv).rgb;                     // 贴图
+}
+
+// ===== 随机数 =====
+// GLSL 没有内置的 random()，需要自己写一个。最常见的写法是：
+//   fract(sin(某个数) * 43758.5453)
+// sin 的结果在 -1 到 1 之间，乘上一个很大的数再取小数部分，输入稍微变一点，输出就会变得毫无规律，
+// 看起来就像随机数（其实是确定的：输入相同，输出就相同）。
+// 那几个数字（12.9898、78.233、43758.5453）是大家约定俗成的 "魔法数"，没有特别含义，只要够大、够乱就行。
+float gSeed;   // 计数器：每调用一次 rand() 就加 1，保证连续几次得到的随机数不一样
+
+// 返回 [0,1) 之间的随机小数
+// 输入由四部分组成，任何一部分变了，结果都会变：
+//   gSeed            —— 同一个像素里，第几次调用
+//   gl_FragCoord.x/y —— 不同的像素得到不同的随机数
+//   uFrame           —— 不同的帧得到不同的随机数（颗粒才会每帧变化）
+float rand() {
+  gSeed += 1.0;
+  float n = gSeed * 12.9898 + gl_FragCoord.x * 78.233 + gl_FragCoord.y * 37.719 + float(uFrame) * 4.581;
+  return fract(sin(n) * 43758.5453);
+}
+
+// 返回一个随机方向的单位向量（均匀分布在球面上）
+vec3 randomUnitVector() {
+  float z = rand() * 2.0 - 1.0;          // z 在 [-1,1] 均匀取值
+  float a = rand() * 6.2831853;          // 绕 z 轴的角度，[0, 2π]
+  float r = sqrt(1.0 - z * z);           // 该高度处圆的半径
+  return vec3(r * cos(a), r * sin(a), z);
+}
+
+// ===== 带反射的光线追踪（对应 JS 版的 rayTraceRecursive，GLSL 不能递归，所以改成循环）=====
+//
+// 递归版展开后的公式：
+//   颜色 = c0·(1-r0) + r0·( c1·(1-r1) + r1·( c2·(1-r2) + ... ) )
+//   其中 c 是各层交点的自身颜色，r 是各层交点的反射度
+// 循环版用 weight 记录 "前面所有反射度的乘积"：
+//   第 0 层 weight = 1；第 1 层 weight = r0；第 2 层 weight = r0·r1 ...
+//   每一层累加：color += weight · (1-r) · 本层颜色
+vec3 trace(vec3 origin, vec3 dir) {
+  vec3 color = vec3(0.0);
+  float weight = 1.0;
+
+  // 循环次数 = 主光线（第 0 层）+ uMaxReflect 次反射，所以 i 从 0 走到 uMaxReflect
+  // WebGL2（GLSL ES 3.00）允许循环上限是变量，不用再写死一个常数
+  for (int i = 0; i <= uMaxReflect; i++) {
+    Hit h = intersectScene(origin, dir);
+    if (h.id < 0) break;                              // 没打中：背景黑色，贡献为 0，结束
+
+    float refl = uRefl[h.id];                         // 被打中三角形的反射度
+
+    // 本层自身颜色，只保留 (1 - 反射度) 的比例
+    color += weight * (1.0 - refl) * shade(h, dir);
+
+    // 没有反射度，或者反射次数用完了：结束（i 是已经反射过的次数）
+    if (refl <= 0.0 || i >= uMaxReflect) break;
+
+    // 准备下一层：沿反射方向继续追踪
+    weight *= refl;                                   // 例：25% → 反射回来的颜色占 25%
+    // 镜面反射方向 r = d - 2(d·n)n：唯一确定的一个方向
+    vec3 mirror = dir - 2.0 * dot(dir, h.normal) * h.normal;
+
+    // 磨砂效果：在镜面方向上叠加一个随机偏移，每次追踪都会得到一个略微不同的方向
+    // roughness 越大，偏得越多：0 = 完美镜面，1 = 偏得很厉害（接近漫反射）
+    if (uRoughness > 0.0) {
+      vec3 jittered = normalize(mirror + uRoughness * randomUnitVector());
+      // 偏过头会射进物体里面（和法线夹角大于 90°），这种情况不采用，仍用镜面方向
+      if (dot(jittered, h.normal) > 0.0) mirror = jittered;
+    }
+    dir = mirror;
+    origin = h.position;                              // 新起点 = 交点（hitTriangle 里的 EPS 防止打中自己）
+  }
+  return color;
+}
+
+// main() 会对画面上的每一个像素各执行一次（GPU 并行），每次执行负责算出 "这个像素" 的颜色。
+// 也就是说：256×256 的画面，这个函数一共跑 65536 次，每次发射一条属于该像素的光线。
+void main() {
+  // ---- 摄影机（和之前一样）----
+  // 这几个值对所有像素都一样：摄影机的朝向、右方向、上方向，以及影像平面的大小
+  vec3 front = vec3(0.0, 0.0, -1.0);   // 朝向：看向 -Z
+  vec3 refUp = vec3(0.0, 1.0, 0.0);    // 参考上方向
+  vec3 right = cross(front, refUp);    // 向右的方向
+  vec3 up    = cross(right, front);    // 真正的上方向
+  float fovScale = tan(radians(uFov * 0.5)) * 2.0;   // 影像平面的边长，fov 越大越宽
+
+  // ---- 当前像素在画面里的位置 ----
+  // gl_FragCoord 是 GPU 内置变量：当前这次 main() 正在处理的像素坐标。
+  // 每个像素执行 main() 时它的值都不同，所以下面算出的光线方向也各不相同。
+  // 它的原点在左下角，除以画布大小后就是 "左下角 (0,0)，右上角 (1,1)" 的取样坐标
+  vec2 s = gl_FragCoord.xy / uRes;
+
+  // ---- 生成这个像素的光线方向 ----
+  // 光线起点是 uEye（所有像素共用，摄影机只有一个位置），方向则因像素而异：
+  vec3 r = right * ((s.x - 0.5) * fovScale);   // 横向偏移：像素越靠右，往右偏越多（中心为 0）
+  vec3 u = up    * ((s.y - 0.5) * fovScale);   // 纵向偏移：像素越靠上，往上偏越多（中心为 0）
+  // 正前方 + 横向偏移 + 纵向偏移 = 影像平面上该像素的位置；再变成单位向量，就是光线方向
+  //   画面正中心的像素：偏移为 0，dir = (0,0,-1)，正对前方
+  //   画面右上角的像素：往右、往上都偏，dir 斜向右上前方
+  // 注意：dir 只由像素位置决定，没有任何随机成分，所以同一个像素每一帧的 dir 都一样，
+  // 画面也就不会有噪点（路径追踪才会对同一像素随机采样很多次，需要降噪）
+  vec3 dir = normalize(front + r + u);
+
+  vec3 color = vec3(0.0);   // 没打中任何物体：黑色背景
+
+  if (uMode == 2) {
+    // 材质 / 反射：交给 trace，它会求交、着色，并在需要时沿反射方向继续追踪
+    // 场景里反射度都是 0 时，trace 只算一层，就是普通的材质渲染
+    //
+    // 每个像素追踪 uSamples 次，再取平均：
+    // 反射方向带有随机偏移，每一次抽到的方向可能偏向亮处也可能偏向暗处，
+    // 单独一次的结果和 "真实的平均值" 之间有随机误差，误差直接显示出来，就是颗粒感。
+    // 多追踪几次再取平均，高低误差互相抵消，结果越来越接近真实值，颗粒就会减少。
+    // uSamples = 1 时只追踪一次，颗粒最明显。
+    // rand() 的结果由像素坐标和帧数决定：不同像素、不同帧的随机数都不一样，
+    // 所以相邻像素的误差各不相同，而且每一帧颗粒的位置都在变（闪烁）
+    gSeed = 0.0;   // 每个像素从 0 开始计数；后面每次调用 rand() 它都会加 1，所以每个样本抽到的随机数各不相同
+    vec3 sum = vec3(0.0);                   // 所有样本的颜色之和
+    for (int k = 0; k < uSamples; k++) {
+      sum += trace(uEye, dir);              // 每次追踪的随机偏移都不同，所以结果都略有差异
+    }
+    color = sum / float(uSamples);          // 除以样本数 = 平均值
+  } else {
+    // 深度图 / 法向量图：和整个场景（所有物体的所有三角形）求最近交点，物体之间的遮挡由求交本身决定
+    // 这就是 "一条光线"：起点 uEye，方向 dir；返回光线第一个打到的东西（没打中时 h.id 为 -1）
+    Hit h = intersectScene(uEye, dir);
+    // 模式 4（降噪用的法线图）：没打中的背景要输出 (0.5,0.5,0.5)，解码后是零向量 (0,0,0)，
+    // 表示 "这里没有法线"；如果是黑色，解码后会变成 (-1,-1,-1)，降噪器会误以为那是一个法线
+    if (uMode == 4) color = vec3(0.5);
+    if (h.id >= 0) {
+      if (uMode == 0) {
+        float maxDepth = 40.0;
+        color = vec3(1.0 - min(h.distance / maxDepth, 1.0));   // 深度图
+      } else if (uMode == 3) {
+        color = albedo(h);                                     // 反照率图
+      } else {
+        color = (h.normal + 1.0) * 0.5;                        // 法向量图（模式 1 和 4）：[-1,1] → [0,1]
+      }
+    }
+  }
+
+  outColor = vec4(color, 1.0);
+}`;
+
+// =====================================================================
+//  第四部分：JavaScript 这一侧，搭 WebGL、传 uniform、触发绘制
+// =====================================================================
+
+var errBox = document.getElementById("err");
+
+function compile(gl, type, src) {
+  var shader = gl.createShader(type);
+  gl.shaderSource(shader, src);
+  gl.compileShader(shader);
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    errBox.textContent += gl.getShaderInfoLog(shader) + "\n";
+    return null;
+  }
+  return shader;
+}
+
+// ---------- 每个物体一个 VAO + VBO ----------
+
+// 把一个物体的所有三角形的顶点，拍成一个数组：
+//   每个顶点 5 个 float：x, y, z, u, v；每个三角形 3 个顶点
+//   [x,y,z,u,v,  x,y,z,u,v,  x,y,z,u,v,  下一个三角形...]
+function packObjectVertices(obj) {
+  var data = new Float32Array(obj.triangles.length * 3 * 5);
+  obj.triangles.forEach(function(tri, i) {
+    var base = i * 15;
+    data.set([tri.v0[0], tri.v0[1], tri.v0[2], tri.uv0[0], tri.uv0[1]], base);
+    data.set([tri.v1[0], tri.v1[1], tri.v1[2], tri.uv1[0], tri.uv1[1]], base + 5);
+    data.set([tri.v2[0], tri.v2[1], tri.v2[2], tri.uv2[0], tri.uv2[1]], base + 10);
+  });
+  return data;
+}
+
+// 为一个物体创建它自己的 VAO 和 VBO
+// 注意：这些 VAO 只是把物体的顶点放进 GPU，演示 "每个物体一份 VAO/VBO" 的标准流程。
+// 本页面是光线追踪，片元着色器读不到它们（它需要随机访问所有三角形，而 VAO 只能按顶点顺序喂给顶点着色器），
+// 画面实际用的三角形数据仍然是下面通过 uniform 传的。
+function createObjectVao(gl, obj) {
+  var data = packObjectVertices(obj);
+  var vao = gl.createVertexArray();          // 这个物体自己的 VAO
+  gl.bindVertexArray(vao);
+  var vbo = gl.createBuffer();               // 这个物体自己的 VBO
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  // DYNAMIC_DRAW：提示 GPU 这份数据会经常更新（墙每帧都在转）
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+  // 每个顶点 5 个 float = 20 字节：前 3 个是位置，后 2 个是贴图坐标
+  gl.enableVertexAttribArray(1);             // 属性 location 1：位置 (x,y,z)
+  gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 20, 0);    // 3 个 float，步长 20 字节，偏移 0
+  gl.enableVertexAttribArray(2);             // 属性 location 2：贴图坐标 (u,v)
+  gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 20, 12);   // 2 个 float，步长 20 字节，偏移 12 字节
+  gl.bindVertexArray(null);
+  return { vao: vao, vbo: vbo, vertexCount: obj.triangles.length * 3 };
+}
+
+// 为一个 canvas 创建渲染器
+//   mode：0=深度 1=法向量 2=材质
+//   makeScene：函数，传入旋转角度，返回这一帧的三角形列表（物体在转，所以每帧都要重新生成）
+//   eye：摄影机位置
+//   image：已经加载好的图片（用作贴图）
+//   stochastic：是否使用磨砂反射（只有 "反射" 那个 canvas 开启，其他 canvas 保持确定的结果）
+function createRenderer(canvasId, mode, makeScene, eye, image, stochastic) {
+  var canvas = document.getElementById(canvasId);
+  var gl = canvas.getContext("webgl2");
+  if (!gl) { errBox.textContent = "你的浏览器不支持 WebGL2"; return null; }
+
+  var program = gl.createProgram();
+  gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, VERT_SRC));
+  gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER, FRAG_SRC));
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    errBox.textContent += gl.getProgramInfoLog(program) + "\n";
+    return null;
+  }
+
+  // ---- 全屏三角形的 VAO：真正用来画图的那一个 ----
+  // 它盖住整个 canvas，让片元着色器对每个像素执行一次（光线追踪就在片元着色器里）
+  var screenVertices = new Float32Array([-1, -1,   3, -1,   -1, 3]);   // 裁剪空间坐标 (x,y)
+  var screenVao = gl.createVertexArray();  // VAO：记录 "顶点数据怎么读" 的配置
+  gl.bindVertexArray(screenVao);           // 绑定后，下面的 VBO 和属性设置都会被记录进这个 VAO
+  var screenVbo = gl.createBuffer();       // VBO：放顶点数据的 GPU 缓冲
+  gl.bindBuffer(gl.ARRAY_BUFFER, screenVbo);   // 绑定为顶点缓冲
+  gl.bufferData(gl.ARRAY_BUFFER, screenVertices, gl.STATIC_DRAW);  // 把数据传到 GPU
+  gl.enableVertexAttribArray(0);           // 启用属性 location 0（着色器里的 aPos）
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);       // 每个顶点 2 个 float，紧密排列
+  gl.bindVertexArray(null);                // 配置完毕，解绑；绘制时只需重新绑定这个 VAO
+
+  // ---- 每个物体各一个 VAO + VBO ----
+  // 先用角度 0 生成一次场景，知道有几个物体，给每个物体各建一对 VAO/VBO
+  var objectBuffers = makeScene(0).map(function(obj) { return createObjectVao(gl, obj); });
+
+  // ---- 贴图：把图片传到 GPU（标准的图片纹理写法）----
+  var texture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  // 图片坐标原点在左上角，而贴图坐标 v=0 在下方，所以上传时垂直翻转一下
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);  // 最后一个参数是图片
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);   // 缩小时线性插值
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);   // 放大时线性插值
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  // ---- 取得各个 uniform 的位置 ----
+  // 数组类型的 uniform 也只需要用数组名（如 "uVerts"）查一次位置，传值时一次性传整个数组
+  var loc = {};
+  ["uCount", "uVerts", "uUVs", "uColor", "uParam", "uRefl", "uMaxReflect", "uRoughness", "uSamples", "uFrame", "uImage",
+   "uRes", "uFov", "uEye", "uMode"].forEach(function(name) {
+    loc[name] = gl.getUniformLocation(program, name);
+  });
+
+  return function draw(fov, angle, maxReflect, roughness, samples, frame) {
+    // 物体在转动，顶点位置每帧都不同：每帧重新生成各个物体
+    var objects = makeScene(angle);
+
+    // 把每个物体最新的顶点重新写进它自己的 VBO（和创建时一样用 bufferData，直接用新数据覆盖）
+    // objects.forEach(function(obj, i) {
+    //   gl.bindBuffer(gl.ARRAY_BUFFER, objectBuffers[i].vbo);
+    //   gl.bufferData(gl.ARRAY_BUFFER, packObjectVertices(obj), gl.DYNAMIC_DRAW);
+    // });
+
+    // 画面用的数据：把所有物体的三角形合并成一个列表，拆成 uniform 数组
+    // 合并之后，着色器能看到整个场景的所有三角形，这才是真正的光线追踪（物体之间可以互相遮挡）
+    var allTriangles = [];
+    objects.forEach(function(obj) { allTriangles = allTriangles.concat(obj.triangles); });
+    var data = toUniformData(allTriangles);
+
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.useProgram(program);
+
+    // 三角形数据：uniform3fv = 传 vec3 数组，uniform4fv = 传 vec4 数组，uniform1fv = 传 float 数组
+    // 下面的数组，第 i 个元素都对应场景里的第 i 个三角形（所有物体的三角形已经合并在一起）
+    gl.uniform1i(loc.uCount, data.count);       // 一个整数：场景里一共有几个三角形（5 个就传 5）
+    gl.uniform3fv(loc.uVerts, data.verts);      // vec3 数组：所有顶点位置 (x,y,z)，世界坐标；每个三角形连续 3 个（v0,v1,v2）
+    gl.uniform2fv(loc.uUVs, data.uvs);          // vec2 数组：所有顶点的贴图坐标 (u,v)；下标和上面的顶点一一对应
+    gl.uniform4fv(loc.uColor, data.color);      // vec4 数组：每个三角形的 (漫反射 r,g,b, 材质类型)，类型 0=phong 1=checker 2=贴图
+    gl.uniform1fv(loc.uParam, data.param);      // float 数组：每个三角形的材质参数（phong 的高光指数，或 checker 的格子大小）
+    gl.uniform1fv(loc.uRefl, data.refl);        // float 数组：每个三角形的反射度（0 = 不反射，1 = 完全镜面）
+    gl.uniform1i(loc.uMaxReflect, maxReflect);  // 一个整数：每条光线最多反射几次，页面上滑块的值
+    gl.uniform1f(loc.uRoughness, stochastic ? roughness : 0);  // 磨砂程度；不是随机的 canvas 固定为 0（镜面）
+    gl.uniform1i(loc.uSamples, stochastic ? samples : 1);      // 每像素采样数，页面上滑块的值；不是随机的 canvas 只算 1 次就够了
+    gl.uniform1i(loc.uFrame, frame);           // 当前帧数，用来让每一帧的随机数都不同
+
+    // 贴图：绑定到纹理单元 0，再告诉着色器 uImage 从单元 0 读
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.uniform1i(loc.uImage, 0);
+
+    // 其他参数
+    gl.uniform2f(loc.uRes, canvas.width, canvas.height);   // vec2：画布的宽、高（像素），着色器用它把像素坐标换算成 0~1 的取样坐标
+    gl.uniform1f(loc.uFov, fov);                           // float：视野角度（度），页面上 FOV 滑块的值，越大看到的范围越广
+    gl.uniform3f(loc.uEye, eye[0], eye[1], eye[2]);        // vec3：摄影机位置 (x,y,z)，所有光线都从这一点射出
+    gl.uniform1i(loc.uMode, mode);                         // int：渲染模式，0=深度图 1=法向量图 2=材质（每个 canvas 固定一个）
+
+    gl.bindVertexArray(screenVao);          // 绑定全屏三角形的 VAO（物体的 VAO 不参与绘制）
+    gl.drawArrays(gl.TRIANGLES, 0, 3);      // 从 VBO 读 3 个顶点，画一个盖住全屏的三角形
+  };
+}
+
+// =====================================================================
+//  第五部分：搭场景
+// =====================================================================
+
+var RED   = [1, 0, 0];
+var BLUE  = [0, 0, 1];
+
+// 绕 Y 轴旋转一个点：以 center 为轴心，旋转 angle 弧度
+// 公式（只动 x、z，y 不变）：
+//   x' =  x·cosθ + z·sinθ
+//   z' = -x·sinθ + z·cosθ
+// 先减去轴心（把轴心移到原点），转完再加回来
+function rotateY(p, center, angle) {
+  var x = p[0] - center[0];
+  var z = p[2] - center[2];
+  var c = Math.cos(angle), s = Math.sin(angle);
+  return [x * c + z * s + center[0], p[1], -x * s + z * c + center[2]];
+}
+
+// 页面上有三个物体，每个物体是一个对象 { triangles: [...] }，里面装着它自己的三角形：
+//   ① 红色三角形      ② 旋转的贴图四边形（墙）      ③ 地板四边形
+// 每个物体之后都会拥有自己的 VAO + VBO（见 createObjectVao）
+
+// ① 红色三角形，立在 z=-10 的平面上（不转）
+// refl：这个物体的反射度，不传就是 0（不反射）
+function makeTriangleObject(refl) {
+  var obj = { triangles: [] };
+  addTriangle(obj.triangles, [-15, 0, -10], [-3, 0, -10], [-9, 16, -10], PhongMaterial(RED, 16, refl));
+  return obj;
+}
+
+// ② 四边形（一面立起来的墙），贴上 img.png，绕自己的中心轴（竖直方向）旋转
+// angle：这一帧绕 Y 轴转过的角度
+function makeWallObject(angle, refl) {
+  var obj = { triangles: [] };
+  // 图片是 322x290，墙高 14，宽取 14 * 322/290 ≈ 15.5，这样图片不会被拉伸
+  // 顶点顺序：左下、右下、右上、左上
+  var center = [10.75, 0, -10];   // 旋转轴心：墙底边的中点（x 取 3 和 18.5 的中点）
+  var a = rotateY([3,    0,  -10], center, angle);
+  var b = rotateY([18.5, 0,  -10], center, angle);
+  var c = rotateY([18.5, 14, -10], center, angle);
+  var d = rotateY([3,    14, -10], center, angle);
+  addQuad(obj.triangles, a, b, c, d, ImageMaterial(refl));
+  return obj;
+}
+
+// ③ 地板：y=0 的大四边形，格子材质
+function makeFloorObject(refl) {
+  var obj = { triangles: [] };
+  addQuad(obj.triangles, [-100, 0, 100], [100, 0, 100], [100, 0, -100], [-100, 0, -100], CheckerMaterial(0.1, refl));
+  return obj;
+}
+
+// 深度 / 法向量的场景：三角形 + 旋转的四边形（2 个物体）
+function makeObjectsScene(angle) {
+  return [makeTriangleObject(), makeWallObject(angle)];
+}
+
+// 材质的场景：地板 + 三角形 + 旋转的四边形（3 个物体）
+function makeMaterialScene(angle) {
+  return [makeFloorObject(), makeTriangleObject(), makeWallObject(angle)];
+}
+
+// 反射的场景：同样的三个物体，但材质带反射度（地板 0.5，其余 0.25）
+function makeReflectScene(angle) {
+  return [makeFloorObject(0.5), makeTriangleObject(0.25), makeWallObject(angle, 0.25)];
+}
+
+var renderers = [];
+
+// 画一帧：angle 是当前旋转角度
+function renderAll(angle, frame) {
+  var fov = +document.getElementById("fov").value;
+  var maxReflect = +document.getElementById("maxReflect").value;
+  var roughness = +document.getElementById("roughness").value;
+  var samples = +document.getElementById("samples").value;
+  renderers.forEach(function(draw) { draw(fov, angle, maxReflect, roughness, samples, frame); });
+}
+
+document.getElementById("roughVal").textContent = (+document.getElementById("roughness").value).toFixed(2);
+document.getElementById("roughness").oninput = function() {
+  document.getElementById("roughVal").textContent = (+this.value).toFixed(2);
+};
+document.getElementById("samplesVal").textContent = document.getElementById("samples").value;
+document.getElementById("samples").oninput = function() {
+  document.getElementById("samplesVal").textContent = this.value;   // 采样数在下一帧自动生效
+};
+
+document.getElementById("mrVal").textContent = document.getElementById("maxReflect").value;
+document.getElementById("maxReflect").oninput = function() {
+  document.getElementById("mrVal").textContent = this.value;   // 反射次数在下一帧自动生效
+};
+document.getElementById("fovVal").textContent = document.getElementById("fov").value;
+document.getElementById("fov").oninput = function() {
+  document.getElementById("fovVal").textContent = this.value;   // FOV 在下一帧自动生效
+};
+
+// =====================================================================
+//  AI 降噪（异步后台）
+// =====================================================================
+// 做法：
+//   每一帧画完后，如果降噪器 "空闲"，就把这一帧的 噪点图、反照率图、法线图 拷贝下来交给降噪器，
+//   降噪在后台进行（execute 返回 Promise，不会卡住动画）。
+//   降噪器忙的时候，新的帧直接跳过，不排队。算完后把结果画到 "AI 降噪后" 的 canvas 上。
+//   所以右边的降噪结果会比左边的实时画面慢几帧（墙转得越快，错位越明显）。
+//
+// 用的库：npm 上的 denoiser@0.0.11（TensorFlow.js 版的 Intel OIDN 网络）。
+//   同时传入 噪点图 + 反照率图 + 法线图 时，库会自动选用 "带引导" 的模型（rt_ldr_calb_cnrm），
+//   利用法线和反照率知道哪里是边缘、哪里是纹理，边缘保留得更好。
+//
+// ---------------------------------------------------------------------
+// 背景知识：这个降噪库是怎么做的？为什么在浏览器里慢，而游戏里能实时？
+// ---------------------------------------------------------------------
+//
+// 【这个库是什么】
+//   底层网络：Intel OIDN 的 U-Net（专门为光线追踪的蒙特卡洛噪点训练的卷积神经网络，
+//             训练好的参数存在 .tza 权重文件里，许可证 Apache-2.0）
+//   运行引擎：TensorFlow.js（用它的层重新搭出 U-Net，并在浏览器里运行）
+//   计算后端：WebGL 或 WebGPU（TensorFlow.js 把每一层卷积翻译成着色器，交给 GPU 算）
+//   所以：我们是在用 "普通着色器" 去模拟跑一个通用的神经网络。
+//
+// 【游戏里的实时降噪有两类】
+//   ① 手写的降噪器（SVGF、NVIDIA NRD、AMD FidelityFX 降噪器）
+//        本质就是计算着色器（compute shader），和我们写的 GLSL 着色器是同一类东西。
+//        做法：时间累积（用运动向量把前几帧挪过来混合）+ 用法线/深度引导的空间滤波。
+//        跑在显卡的普通着色器核心上，每帧只要几毫秒。
+//        —— 这类可以放进浏览器，但它不是 AI。
+//   ② AI 降噪（例如 DLSS 光线重建）
+//        游戏不自己写着色器，而是接入厂商的 SDK，由驱动调用预先训练好的神经网络。
+//        网络的矩阵运算跑在显卡的专用硬件 "张量核心（Tensor Core）" 上，
+//        比普通着色器核心做神经网络快一个数量级；网络还经过裁剪和量化（用 16 位甚至 8 位计算），
+//        并且直接读取 GPU 里的法线、深度、运动向量，数据全程不离开显卡。
+//        送进网络的输入也不是单个样本，而是已经做过几帧时间累积的，质量好很多。
+//
+// 【显卡里的几种硬件】
+//   着色器核心：通用计算，跑着色器（渲染、手写降噪器）
+//   RT 核心   ：专门做光线和 BVH / 三角形的求交（硬件光线追踪）
+//   张量核心  ：专门做矩阵乘法（DLSS、AI 降噪）
+//   并不是所有 AI 技术都必须要专用硬件：AMD 的 FSR 就是纯着色器实现；
+//   Intel 的 XeSS 在没有专用单元的显卡上会退回用着色器指令（DP4a）。
+//
+// 【为什么我们这里慢】
+//   - WebGL / WebGPU 的着色器只能用普通着色器核心，用不上张量核心和 RT 核心
+//   - TensorFlow.js 用 WebGL 跑神经网络，是把矩阵运算伪装成 "画图"，效率很低
+//   - 我们用的是通用的、给离线渲染训练的网络，没有为实时做过裁剪
+//   - 每次降噪还要经历 "拷贝图片 → 转张量 → 计算 → 读回 CPU → 画到 canvas"，读回 CPU 是同步点
+//   - TensorFlow.js 有自己的 GPU 上下文，和我们的 WebGL 画布在抢同一块 GPU
+//   所以慢不是 "降噪本身就这么慢"，而是这条路径没有任何实时优化。
+//
+// 【在浏览器里想更快有哪些办法】
+//   1. 把 new Denoiser("webgl") 改成 "webgpu"（计算着色器比 WebGL 更适合神经网络，需要浏览器支持）
+//   2. 降低分辨率（像素数少 4 倍，速度约快 4 倍）、只传噪点图不传辅助图
+//   3. 限制降噪频率（下面的 DENOISE_INTERVAL_MS），给渲染留出 GPU 时间
+//   4. 换成 pmndrs/denoiser 的 v2（WebGPU，手写 WGSL 实现网络，不用 TensorFlow.js；还没发布到 npm，要自己构建）
+//   5. 自己训练一个很小的网络（几层卷积），写成 WebGL 着色器跑推理，几毫秒完成
+//   6. 浏览器的 WebNN 接口目标是调用系统的专用 AI 加速器（NPU 等），但还很新，支持有限
+//
+// ---------------------------------------------------------------------
+// 这个项目属于哪一类技术：AI 与传统图形学结合的 "混合渲染管线"（hybrid / AI-augmented rendering）
+// ---------------------------------------------------------------------
+//
+// 【光线追踪的几个层次（从简单到复杂）】
+//   光线投射（ray casting）  ：只发主光线，直接用光照公式算颜色        —— 本页的深度图、法线图、材质图
+//   Whitted 光线追踪         ：在镜面方向等 "确定" 的方向继续追踪        —— 本页的镜面反射、阴影
+//   分布式光线追踪           ：在一个范围里随机抽多个方向再平均          —— 本页的磨砂反射（roughness + spp）
+//   路径追踪（path tracing） ：所有表面都往随机方向弹射，光来自发光体，模拟全局光照
+//   它们都属于广义的 "光线追踪"；路径追踪是其中最通用、最真实、也最贵的一种。
+//   磨砂反射和路径追踪用的是同一个数学工具：蒙特卡洛（随机采样 + 取平均），
+//   区别只是随机性用在哪些地方：磨砂反射只用在镜面方向上，路径追踪用在所有表面的弹射上。
+//
+// 【AI 嵌入图形管线的两种典型方式】
+//   前置：AI 先帮你得到传统方法拿不到的信息，再交给传统渲染
+//         例：从一张 2D 图片用 Transformer 深度估计模型得到深度 → 算出法线 → 用传统光照重新打光
+//             （基于深度估计的 2.5D 重光照，属于 "感知 + 渲染"）
+//   后置：先用传统方法渲染（样本少，有噪点），再让 AI 修复结果
+//         例：本页的 "光线追踪 + AI 降噪"（属于 "渲染 + 后处理"）
+//         业界对应：Intel OIDN、NVIDIA DLSS 光线重建；同类的还有 AI 超分辨率、帧生成
+//
+// 【和 "神经渲染"（neural rendering）的区别】
+//   严格意义上的神经渲染，指神经网络本身就是渲染器或场景表示（例如 NeRF、3D Gaussian Splatting、
+//   神经辐射缓存），网络直接学会 "某个视角下场景长什么样"。
+//   本页以及上面说的重光照，网络都只是流水线里的一个环节，核心的光照 / 光线追踪仍是传统算法，
+//   所以更准确的叫法是 "混合渲染管线" 或 "AI 增强的渲染"，而不是神经渲染。
+//
+// 库文件和模型权重都已经下载到本地（vendor/denoiser/），不再每次从网上获取：
+//   vendor/denoiser/index.mjs  —— 库本身（TensorFlow.js 已经打包在里面，是一个自包含的文件）
+//   vendor/denoiser/tzas/*.tza —— OIDN 的权重文件（只下载了 8 位普通图用的 ldr 系列）
+// 如果想改回从网上加载：DENOISER_URL 用 "https://esm.sh/denoiser@0.0.11"，并删掉下面的 weightsUrl 那一行
+var DENOISER_URL = "./vendor/denoiser/index.mjs";
+// 权重地址必须是完整的绝对地址（如 http://localhost:8000/vendor/denoiser/tzas）：
+// 库内部会用 new URL(地址) 解析文件名，没有基准地址时相对路径会报 "Invalid URL"。
+// new URL(相对路径, location.href) 会基于当前页面的地址，拼出完整地址
+var DENOISER_WEIGHTS_URL = new URL("./vendor/denoiser/tzas", location.href).href;
+
+var denoiser = null;        // 降噪器，第一次勾选时才创建
+var denoiserLoading = false;
+var denoiseBusy = false;    // 正在降噪：为 true 时跳过新的帧
+var denoiseStatus = document.getElementById("denoiseStatus");
+var denoisedCtx = document.getElementById("denoisedCanvas").getContext("2d");
+
+// 三张离屏的 2D canvas：用来存 "这一帧" 的快照。
+// 为什么要拷贝？WebGL 画布画完后下一帧会被覆盖，降噪又很慢（要几百毫秒），
+// 降噪期间画布早就变了，所以要先存一份不变的快照给降噪器用
+function makeSnapshotCanvas() {
+  var c = document.createElement("canvas");
+  c.width = 256;
+  c.height = 256;
+  return c;
+}
+var snapColor = makeSnapshotCanvas();
+var snapAlbedo = makeSnapshotCanvas();
+var snapNormal = makeSnapshotCanvas();
+
+// 加载降噪库并创建降噪器（只做一次）
+async function loadDenoiser() {
+  if (denoiser || denoiserLoading) return;
+  denoiserLoading = true;
+  try {
+    denoiseStatus.textContent = "正在加载降噪库（含 TensorFlow.js，比较大）…";
+    var mod = await import(DENOISER_URL);        // 普通 <script> 里也可以用动态 import
+    denoiser = new mod.Denoiser("webgl");        // 参数是 TensorFlow.js 的计算后端
+    denoiser.weightsUrl = DENOISER_WEIGHTS_URL;  // 权重从本地读取（默认是 jsDelivr 的 CDN）
+    denoiser.quality = "fast";                   // fast / balanced / high；后台实时用，选最快的
+    denoiseStatus.textContent = "降噪器已就绪，等待第一帧…（第一次降噪要下载权重并构建网络，比较慢）";
+  } catch (e) {
+    errBox.textContent += "加载降噪库失败：" + (e && e.message ? e.message : e) + "\n";
+    denoiseStatus.textContent = "";
+    document.getElementById("denoiseOn").checked = false;
+  }
+  denoiserLoading = false;
+}
+
+// 在每帧画完之后调用，尝试开始一次后台降噪
+function startDenoise() {
+  if (!document.getElementById("denoiseOn").checked) return;   // 没勾选
+  if (!denoiser || denoiseBusy) return;                         // 还没加载好，或者上一次还没算完：跳过这一帧
+
+  // 把三个 WebGL canvas 当前的画面拷贝到快照里。
+  // 必须在 "画完之后、同一段 JS 里" 立刻拷贝，否则 WebGL 画布的内容可能已经被清空
+  snapColor.getContext("2d").drawImage(document.getElementById("rayTraceReflectionCanvas"), 0, 0);
+  snapAlbedo.getContext("2d").drawImage(document.getElementById("albedoCanvas"), 0, 0);
+  snapNormal.getContext("2d").drawImage(document.getElementById("auxNormalCanvas"), 0, 0);
+
+  denoiseBusy = true;
+  var t0 = performance.now();
+
+  // execute(噪点图, 反照率图, 法线图)：返回 Promise，降噪在后台进行，结果是降噪后的 ImageData
+  denoiser.execute(snapColor, snapAlbedo, snapNormal)
+    .then(function(result) {
+      denoisedCtx.putImageData(result, 0, 0);
+      denoiseStatus.textContent = "降噪一帧耗时 " + (performance.now() - t0).toFixed(0) + " ms（动画仍在继续）";
+    })
+    .catch(function(e) {
+      errBox.textContent += "降噪出错：" + (e && e.message ? e.message : e) + "\n";
+      document.getElementById("denoiseOn").checked = false;   // 出错就自动关掉，避免每帧都报错
+      denoiseStatus.textContent = "";
+    })
+    .then(function() {
+      denoiseBusy = false;   // 无论成功失败，都标记为空闲，下一帧可以再开始
+    });
+}
+
+// 勾选时才加载库（体积大，不勾选就不下载）
+document.getElementById("denoiseOn").onchange = function() {
+  if (this.checked) loadDenoiser();
+  else denoiseStatus.textContent = "";
+};
+
+// 动画循环：每一帧都根据时间算出角度，重新画一遍
+// requestAnimationFrame 会在浏览器下次刷新屏幕前调用，time 是毫秒时间戳
+var frameCount = 0;   // 已经画了多少帧，传给着色器当随机数种子的一部分
+function animate(time) {
+  var angle = time * 0.001;   // 每秒转 1 弧度（约 57°），想快一点就把 0.001 改大
+  renderAll(angle, frameCount++);
+  startDenoise();   // 画完之后立刻尝试开始一次后台降噪（降噪器忙的话会自动跳过）
+  requestAnimationFrame(animate);   // 请求下一帧，形成循环
+}
+
+// 图片是异步加载的：必须等 onload 之后才能上传到 GPU，所以渲染器放在回调里创建
+var image = new Image();
+image.onload = function() {
+  renderers = [
+    createRenderer("depthCanvas",    0, makeObjectsScene,  [0, 8, 15], image),
+    createRenderer("normalCanvas",   1, makeObjectsScene,  [0, 8, 15], image),
+    createRenderer("rayTraceCanvas", 2, makeMaterialScene, [0, 5, 15], image),
+    createRenderer("rayTraceReflectionCanvas", 2, makeReflectScene, [0, 5, 15], image, true),   // true：开启磨砂反射
+    // 下面两个是给 AI 降噪准备的辅助图：场景和摄影机必须和上面的反射 canvas 完全一样，像素才对得上
+    createRenderer("albedoCanvas",    3, makeReflectScene, [0, 5, 15], image),
+    createRenderer("auxNormalCanvas", 4, makeReflectScene, [0, 5, 15], image)
+  ].filter(Boolean);
+  requestAnimationFrame(animate);   // 启动动画循环
+};
+image.onerror = function() {
+  errBox.textContent = "图片 img.png 加载失败（路径不对，或没有用本地服务器打开页面）";
+};
+image.src = "img.png";   // 和 html 放在同一目录
+</script>
+</body>
+</html>
