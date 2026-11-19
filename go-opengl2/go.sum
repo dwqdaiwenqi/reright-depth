@@ -1,3 +1,5 @@
+github.com/AllenDang/cimgui-go v1.6.1 h1:vhQOANkZSs2tm53zPe/HBQW3vln0ZuW3/vqHRsAPPn8=
+github.com/AllenDang/cimgui-go v1.6.1/go.mod h1:97bmd2B2Y0+uCePDqGSLcM5Dbpwt11yaGgQphz89USY=
 github.com/go-gl/gl v0.0.0-20260331235117-4566fea9a276 h1:IO5P06Pcj9K04d+l4nrf3c2U56+dAotIFG6u4P1wAHI=
 github.com/go-gl/gl v0.0.0-20260331235117-4566fea9a276/go.mod h1:9YTyiznxEY1fVinfM7RvRcjRHbw2xLBJ3AAGIT0I4Nw=
 github.com/go-gl/glfw/v3.3/glfw v0.0.0-20260823155953-d41da22a9587 h1:yzPGEmWIlLQvQ0HvNHpRzLwyJ3pAmVXpa6pGclnH9Ks=

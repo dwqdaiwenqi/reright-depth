@@ -1,4 +1,5 @@
 // Go + OpenGL 4.1 版重光照，和 main.js（WebGL2）一一对应。
+// 窗口和控制面板用 Dear ImGui（cimgui-go），滑块可以直接拖动。
 //
 //  1. 加载 30-3.png，立刻打开窗口
 //  2. 【后台协程】POST 到 gen_normal_dav2.py 的 /depth（format=float），拿到 float32 深度
@@ -9,7 +10,7 @@
 //	main.go    入口：参数、窗口、启动协程、主循环
 //	depth.go   请求并解析深度图（HTTP）
 //	gfx.go     OpenGL：着色器、纹理、渲染器
-//	input.go   键盘鼠标、光照参数
+//	ui.go      光照参数、ImGui 控制面板、鼠标控制光源
 //	shader.*   GLSL 源码
 //
 // 运行（先启动深度服务：python3 tools/gen_normal_dav2.py --serve --port 7860）：
@@ -30,12 +31,16 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/AllenDang/cimgui-go/backend"
+	"github.com/AllenDang/cimgui-go/backend/glfwbackend"
+	"github.com/AllenDang/cimgui-go/imgui"
+	_ "github.com/AllenDang/cimgui-go/impl/glfw"    // ImGui 的 GLFW 平台层（副作用导入）
+	_ "github.com/AllenDang/cimgui-go/impl/opengl3" // ImGui 的 OpenGL3 渲染层（副作用导入）
 	"github.com/go-gl/gl/v4.1-core/gl"
-	"github.com/go-gl/glfw/v3.3/glfw"
 )
 
 func init() {
-	runtime.LockOSThread() // glfw / OpenGL 必须在主线程
+	runtime.LockOSThread() // GLFW / OpenGL 必须在主线程
 }
 
 // 协程把结果交给主线程的"信封"
@@ -47,7 +52,7 @@ type depthResult struct {
 
 func main() {
 	imagePath := flag.String("image", "30-3.png", "输入图片路径")
-	server := flag.String("server", "http://localhost:7860", "深度服务地址")
+	server := flag.String("server", "http://localhost:8888", "深度服务地址")
 	size := flag.String("size", "small", "模型大小：small | base | large")
 	flag.Parse()
 
@@ -61,40 +66,15 @@ func main() {
 		log.Fatalf("解码图片失败: %v", err)
 	}
 
-	// ── 2. 窗口 + OpenGL 上下文 ────────────────────
-	if err := glfw.Init(); err != nil {
-		log.Fatal(err)
+	// 图像区域按图片宽高比缩放，最长边不超过 900；窗口右边再留出控制面板
+	imgW, imgH := img.Bounds().Dx(), img.Bounds().Dy()
+	if m := max(imgW, imgH); m > 900 {
+		imgW, imgH = imgW*900/m, imgH*900/m
 	}
-	defer glfw.Terminate()
 
-	glfw.WindowHint(glfw.ContextVersionMajor, 4)
-	glfw.WindowHint(glfw.ContextVersionMinor, 1)
-	glfw.WindowHint(glfw.OpenGLProfile, glfw.OpenGLCoreProfile)
-	glfw.WindowHint(glfw.OpenGLForwardCompatible, glfw.True)
-
-	// 窗口按图片宽高比缩放，最长边不超过 900（对应 CSS 里把画布缩小显示）
-	winW, winH := img.Bounds().Dx(), img.Bounds().Dy()
-	if m := max(winW, winH); m > 900 {
-		winW, winH = winW*900/m, winH*900/m
-	}
-	window, err := glfw.CreateWindow(winW, winH, "Relight", nil, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-	window.MakeContextCurrent()
-	glfw.SwapInterval(1) // 垂直同步，对应浏览器的 requestAnimationFrame 节奏
-
-	if err := gl.Init(); err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println("OpenGL 版本:", gl.GoStr(gl.GetString(gl.VERSION)))
-
-	r := newRenderer(img)
 	s := newState()
-	s.bind(window)
-	printHelp()
 
-	// ── 3. 后台协程请求深度图 ──────────────────────
+	// ── 2. 后台协程请求深度图 ──────────────────────
 	// Node.js：
 	//   fetchDepth(...).then(depth => { ... })      // 不阻塞，结果回来再处理
 	// Go：
@@ -111,32 +91,50 @@ func main() {
 		resultCh <- depthResult{depth: d, err: err, took: time.Since(t0)} // 发送：相当于 resolve(...)
 	}()
 
-	s.status = "请求深度图中…"
-	window.SetTitle(s.title())
+	// ── 3. 窗口 ────────────────────────────────────
+	// 窗口、OpenGL 上下文、事件循环都由 cimgui-go 的 GLFW 后端管理，
+	// 我们只需要提供"每一帧要做什么"的函数
+	b, err := backend.CreateBackend(glfwbackend.NewGLFWBackend())
+	if err != nil {
+		log.Fatal(err)
+	}
+	b.SetBgColor(imgui.NewVec4(0.125, 0.125, 0.18, 1)) // 背景色（后端每帧开头清屏用）
+	b.CreateWindow("Relight", imgW+panelW, imgH)
 
-	// ── 4. 主循环 ──────────────────────────────────
+	var r *renderer // 要等 OpenGL 上下文准备好才能创建，所以在第一帧里创建
+
+	// ── 4. 每一帧 ──────────────────────────────────
 	// JS：function frame() { ...; requestAnimationFrame(frame) }
-	for !window.ShouldClose() {
+	b.Run(func() {
+		if r == nil {
+			if err := gl.Init(); err != nil { // 上下文此时已经是当前的，可以加载 GL 函数
+				log.Fatal(err)
+			}
+			fmt.Println("OpenGL 版本:", gl.GoStr(gl.GetString(gl.VERSION)))
+			r = newRenderer(img)
+		}
+
 		// select + default：看一眼通道里有没有结果，没有就【不等】，继续画
 		// 相当于 JS 里"每一帧检查 promise 是否已完成"
 		select {
 		case res := <-resultCh:
 			if res.err != nil {
 				fmt.Println("✗", res.err)
-				s.status = "深度图失败，见终端"
+				s.status = "Depth map FAILED (flat lighting only). See the terminal for the error. If the server is running, restart it: python3 tools/gen_normal_dav2.py --serve --port 7860"
 			} else {
 				r.setDepth(res.depth)
 				fmt.Printf("深度图已获取（%.2fs，%d×%d）\n", res.took.Seconds(), res.depth.width, res.depth.height)
-				s.status = fmt.Sprintf("深度图 %.1fs", res.took.Seconds())
+				s.status = fmt.Sprintf("Depth map ready (%.1fs, %dx%d)", res.took.Seconds(), res.depth.width, res.depth.height)
 			}
-			window.SetTitle(s.title())
 		default:
 		}
 
-		fbW, fbH := window.GetFramebufferSize()
-		r.draw(s, fbW, fbH)
+		s.updateLight(float32(imgW), float32(imgH))
 
-		window.SwapBuffers()
-		glfw.PollEvents()
-	}
+		// 视网膜屏：窗口坐标 → 像素，要乘缩放比例
+		scale := imgui.CurrentIO().DisplayFramebufferScale().X
+		r.draw(s, int32(float32(imgW)*scale), int32(float32(imgH)*scale))
+
+		s.drawPanel(float32(imgW), float32(imgH)) // ImGui 控件在这之后由后端统一绘制
+	})
 }

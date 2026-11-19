@@ -1,8 +1,3 @@
-//go:build ignore
-
-// 三角形学习版（原来的 main.go），运行：go run triangle.go
-// 第一行的 build tag 让 go run . / go build 忽略它，避免和 main.go 里的 func main 冲突
-
 package main
 
 import (

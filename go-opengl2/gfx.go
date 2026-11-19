@@ -71,11 +71,10 @@ func (r *renderer) setDepth(d *depthMap) {
 }
 
 // JS：function frame() { ... }
-func (r *renderer) draw(s *state, fbW, fbH int) {
-	// 视网膜屏上，帧缓冲的像素数 ≠ 窗口坐标数，viewport 要用帧缓冲尺寸
-	gl.Viewport(0, 0, int32(fbW), int32(fbH))
-	gl.ClearColor(0.125, 0.125, 0.18, 1) // 背景色
-	gl.Clear(gl.COLOR_BUFFER_BIT)
+// viewW/viewH：图像区域的【像素】尺寸（窗口右边还要留给控制面板）
+// 清屏和 glViewport 全屏已经由 ImGui 后端在每帧开头做过了，这里只把 viewport 缩到图像区域
+func (r *renderer) draw(s *state, viewW, viewH int32) {
+	gl.Viewport(0, 0, viewW, viewH)
 
 	gl.UseProgram(r.program)
 	gl.Uniform3f(r.u.lightPos, s.lightX, s.lightY, s.height)
@@ -85,7 +84,11 @@ func (r *renderer) draw(s *state, fbW, fbH int) {
 	gl.Uniform1f(r.u.depthScale, s.depthScale)
 	gl.Uniform1f(r.u.ambient, s.ambient)
 	gl.Uniform1i(r.u.shadowMode, s.shadowMode)
-	gl.Uniform1i(r.u.showDepth, s.showDepth)
+	var showDepth int32 // bool 不能直接传给 uniform，转成 0/1
+	if s.showDepth {
+		showDepth = 1
+	}
+	gl.Uniform1i(r.u.showDepth, showDepth)
 
 	// 纹理单元 0 放原图，1 放深度图；sampler 里填的是"单元号"
 	gl.ActiveTexture(gl.TEXTURE0)
