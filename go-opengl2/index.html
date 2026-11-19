@@ -1,5 +1,37 @@
 <!DOCTYPE html>
 <meta charset="UTF-8">
-<title>Triangle</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Relight</title>
+<style>
+  body { margin: 0; background: #14141f; color: #cbd5e1; font: 13px system-ui, sans-serif;
+         display: flex; gap: 16px; padding: 16px; height: 100vh; box-sizing: border-box; }
+  canvas { height: 100%; max-width: calc(100vw - 280px); object-fit: contain;
+           background: #20202e; cursor: crosshair; border-radius: 6px; }
+  aside { width: 230px; flex-shrink: 0; }
+  #status { margin-bottom: 14px; color: #7dd3fc; line-height: 1.5; word-break: break-all; }
+  label { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  label span:first-child { width: 56px; }
+  input[type=range] { flex: 1; min-width: 0; }
+  select { flex: 1; }
+</style>
+
 <canvas id="c"></canvas>
+<aside>
+  <div id="status">准备中…</div>
+  <label><span>光强</span><input id="sIntensity" type="range" min="0" max="4" step="0.05" value="1.5"><span id="sIntensityVal">1.5</span></label>
+  <label><span>光高度</span><input id="sHeight" type="range" min="0.2" max="3" step="0.05" value="1.5"><span id="sHeightVal">1.5</span></label>
+  <label><span>环境光</span><input id="sAmbient" type="range" min="0" max="1" step="0.02" value="0.2"><span id="sAmbientVal">0.2</span></label>
+  <label><span>深度强</span><input id="sDepthScale" type="range" min="0.01" max="0.5" step="0.01" value="0.08"><span id="sDepthScaleVal">0.08</span></label>
+  <label><span>高光</span><input id="sSpecular" type="range" min="0" max="2" step="0.05" value="0.4"><span id="sSpecularVal">0.4</span></label>
+  <label><span>阴影</span>
+    <select id="sShadow">
+      <option value="0">无阴影</option>
+      <option value="1">距离衰减</option>
+      <option value="2">硬阴影</option>
+      <option value="3" selected>RayMarch 软阴影</option>
+      <option value="4">RayMarch + 抖动</option>
+    </select>
+  </label>
+</aside>
+
 <script src="./main.js"></script>
