@@ -149,7 +149,9 @@ def depth_image(img_rgb: Image.Image, alpha_mask, model_id: str, device: str) ->
 
 
 def serve(default_size: str, port: int):
-    from flask import Flask, request, jsonify
+    # from flask import Flask, request, jsonify          # [旧]
+    from flask import Flask, request, jsonify, Response  # [新] 多了 Response，用来返回二进制
+    import struct                                        # [新] 打包 宽/高 的字节
     from flask_cors import CORS
 
     app = Flask(__name__)
@@ -193,11 +195,35 @@ def serve(default_size: str, port: int):
 
             pipe = get_pipe(size)
             result = pipe(img_rgb)
-            depth = np.array(result["depth"].convert("L")).astype(np.float32) / 255.0
-            depth_vis = (depth * 255).astype(np.uint8)
-            if alpha_mask is not None:
-                depth_vis[alpha_mask < 16] = 0
+            # ───────────── [旧] 用 result["depth"]：库已经压成 8 位（只有 256 档）的预览图 ─────────────
+            # depth = np.array(result["depth"].convert("L")).astype(np.float32) / 255.0
+            # depth_vis = (depth * 255).astype(np.uint8)
+            # if alpha_mask is not None:
+            #     depth_vis[alpha_mask < 16] = 0
+            #
+            # depth_img = Image.fromarray(depth_vis)
+            # return jsonify({"depth": image_to_b64(depth_img)})
 
+            # ───────────── [新] 用 result["predicted_depth"]：模型原始输出，float32，不丢精度 ─────────────
+            import torch.nn.functional as F
+            t = result["predicted_depth"].float()                       # 模型原始输出（小数）
+            t = t.reshape(1, 1, t.shape[-2], t.shape[-1])
+            t = F.interpolate(t, size=(img_rgb.height, img_rgb.width),  # 放大回原图尺寸
+                              mode="bicubic", align_corners=False)
+            depth = t[0, 0].cpu().numpy().astype(np.float32)
+            depth = np.clip(depth / max(float(depth.max()), 1e-6), 0.0, 1.0)  # 归一化到 0~1，白=近
+            if alpha_mask is not None:
+                depth[alpha_mask < 16] = 0.0                            # 透明处 = 最远
+
+            # format=float：直接返回 float32 二进制
+            #   响应体 = uint32 宽 + uint32 高（小端）+ 宽*高 个 float32（小端，行优先，第 0 行在顶部）
+            if (request.form.get("format") or "") == "float":
+                h, w = depth.shape
+                body = struct.pack("<II", w, h) + np.ascontiguousarray(depth, dtype="<f4").tobytes()
+                return Response(body, mimetype="application/octet-stream")
+
+            # 没带 format：和旧版一样返回 8 位 PNG 的 JSON（让 depth-tester.html 等旧页面继续能用）
+            depth_vis = (depth * 255).astype(np.uint8)
             depth_img = Image.fromarray(depth_vis)
             return jsonify({"depth": image_to_b64(depth_img)})
 

@@ -5,8 +5,10 @@
 <style>
   body { margin: 0; background: #14141f; color: #cbd5e1; font: 13px system-ui, sans-serif;
          display: flex; gap: 16px; padding: 16px; height: 100vh; box-sizing: border-box; }
-  canvas { height: 100%; max-width: calc(100vw - 280px); object-fit: contain;
-           background: #20202e; cursor: crosshair; border-radius: 6px; }
+  #c { height: 100%; max-width: calc(100vw - 280px); object-fit: contain;
+       background: #20202e; cursor: crosshair; border-radius: 6px; }
+  #depthView { width: 100%; height: auto; background: #20202e; border-radius: 6px; margin-top: 6px; display: block; }
+  h3 { margin: 18px 0 0; font-size: 12px; font-weight: 600; color: #94a3b8; }
   aside { width: 230px; flex-shrink: 0; }
   #status { margin-bottom: 14px; color: #7dd3fc; line-height: 1.5; word-break: break-all; }
   label { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
@@ -32,6 +34,9 @@
       <option value="4">RayMarch + 抖动</option>
     </select>
   </label>
+
+  <h3>深度图（白=近，黑=远）</h3>
+  <canvas id="depthView"></canvas>
 </aside>
 
 <script src="./main.js"></script>

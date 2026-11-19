@@ -6,8 +6,8 @@
 // 运行方式见 index.html 同目录下的说明（需要起一个本地静态服务器，不能直接双击打开）
 
 const IMAGE_URL = './25-3.png';
-const DEPTH_SERVER = 'http://localhost:7860'; // python tools/gen_normal_dav2.py --serve
-const MODEL_SIZE = 'small';                   // small | base | large
+const DEPTH_SERVER = 'http://localhost:8888'; // python tools/gen_normal_dav2.py --serve
+const MODEL_SIZE = 'base';                   // small | base | large
 
 // ── 着色器 ──────────────────────────────────────────────────────
 const vertexSrc = /*glsl*/`#version 300 es
@@ -139,15 +139,23 @@ async function main() {
     // 2. 请求深度图
     status.textContent = `请求 ${DEPTH_SERVER}/depth …（首次要加载模型，可能要等一会）`;
     const t0 = performance.now();
-    const depthBitmap = await fetchDepth(imageBlob);
+    // [旧] 拿到的是 ImageBitmap（8 位 PNG 解码出来的图）
+    // const depthBitmap = await fetchDepth(imageBlob);
+    // [新] 拿到的是 { width, height, data: Float32Array }（原始小数）
+    const depth = await fetchDepth(imageBlob);
     const sec = ((performance.now() - t0) / 1000).toFixed(2);
-    status.textContent = `深度图已获取（${sec}s，${depthBitmap.width}×${depthBitmap.height}）· 移动鼠标改变光源`;
+    // [旧] status.textContent = `深度图已获取（${sec}s，${depthBitmap.width}×${depthBitmap.height}）· 移动鼠标改变光源`;
+    status.textContent = `深度图已获取（${sec}s，${depth.width}×${depth.height}）· 移动鼠标改变光源`;
+
+    // 2.5 把深度图单独画到侧栏的小画布里，方便肉眼检查
+    showDepthPreview(depth);
 
     // 3. 初始化 GL
     const program = newProgram(gl, vertexSrc, fragmentSrc);
     const vao = newFullscreenQuad(gl);
     const imageTex = newTexture(gl, imageBitmap);
-    const depthTex = newTexture(gl, depthBitmap);
+    // [旧] const depthTex = newTexture(gl, depthBitmap);   // RGBA8，每个通道只有 0~255
+    const depthTex = newFloatTexture(gl, depth);            // [新] R32F / R16F，保留小数
 
     const u = {};
     for (const name of ['uImage', 'uDepth', 'uLightPos', 'uIntensity', 'uSpecular',
@@ -210,27 +218,64 @@ async function main() {
   }
 }
 
-// ── 请求深度图：POST {server}/depth，字段 image + size ─────────────
-// 响应：{ "depth": "<base64 png>" } 或 { "error": "..." }
+// ───────────── [旧] 8 位 PNG 版 fetchDepth（已注释，留作对比）─────────────
+// // ── 请求深度图：POST {server}/depth，字段 image + size ─────────────
+// // 响应：{ "depth": "<base64 png>" } 或 { "error": "..." }
+// async function fetchDepth(imageBlob) {
+//   const form = new FormData();
+//   form.append('image', imageBlob, '30-3.png');
+//   form.append('size', MODEL_SIZE);
+//
+//   let res;
+//   try {
+//     res = await fetch(`${DEPTH_SERVER}/depth`, { method: 'POST', body: form });
+//   } catch (e) {
+//     throw new Error(`连不上 ${DEPTH_SERVER}，深度服务启动了吗？（python tools/gen_normal_dav2.py --serve）`);
+//   }
+//   if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+//
+//   const data = await res.json();
+//   if (data.error) throw new Error('服务端错误: ' + data.error);
+//
+//   // base64 → Blob → ImageBitmap
+//   const bytes = Uint8Array.from(atob(data.depth), c => c.charCodeAt(0));
+//   return createImageBitmap(new Blob([bytes], { type: 'image/png' }), { imageOrientation: 'flipY' });
+// }
+
+// ── 请求深度图（新）：POST {server}/depth，字段 image + size + format=float ──
+// 响应是二进制：uint32 宽 + uint32 高（小端）+ 宽*高 个 float32（小端，第 0 行在顶部）
 async function fetchDepth(imageBlob) {
   const form = new FormData();
   form.append('image', imageBlob, '30-3.png');
   form.append('size', MODEL_SIZE);
+  form.append('format', 'float'); // [新] 告诉服务端：不要 8 位 PNG，给我 float
 
   let res;
   try {
     res = await fetch(`${DEPTH_SERVER}/depth`, { method: 'POST', body: form });
   } catch (e) {
-    throw new Error(`连不上 ${DEPTH_SERVER}，深度服务启动了吗？（python tools/gen_normal_dav2.py --serve）`);
+    throw new Error(`连不上 ${DEPTH_SERVER}，深度服务启动了吗？（python3 tools/gen_normal_dav2.py --serve）`);
   }
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+  if ((res.headers.get('content-type') || '').includes('json')) {
+    // 旧版服务端不认识 format=float，会返回 JSON（8 位 PNG）
+    throw new Error('服务端返回了 JSON，请重启 gen_normal_dav2.py（需要新版才支持 format=float）');
+  }
 
-  const data = await res.json();
-  if (data.error) throw new Error('服务端错误: ' + data.error);
+  // [旧] const data = await res.json();  → base64 → Blob → createImageBitmap（见上面注释掉的版本）
+  const buf = await res.arrayBuffer();
+  const view = new DataView(buf);
+  const width = view.getUint32(0, true);  // true = 小端
+  const height = view.getUint32(4, true);
+  const data = new Float32Array(buf, 8, width * height); // 偏移 8 字节，是 4 的倍数，可以直接映射
 
-  // base64 → Blob → ImageBitmap
-  const bytes = Uint8Array.from(atob(data.depth), c => c.charCodeAt(0));
-  return createImageBitmap(new Blob([bytes], { type: 'image/png' }), { imageOrientation: 'flipY' });
+  // 服务端第 0 行在顶部，纹理 v=0 在底部，所以把行顺序翻过来
+  // （[旧] 版本靠 createImageBitmap 的 imageOrientation: 'flipY' 翻；这里是原始数组，要自己翻）
+  const flipped = new Float32Array(width * height);
+  for (let y = 0; y < height; y++) {
+    flipped.set(data.subarray(y * width, (y + 1) * width), (height - 1 - y) * width);
+  }
+  return { width, height, data: flipped };
 }
 
 // ── 全屏四边形：每个顶点 x, y, u, v，v 向上（左下角 uv=(0,0)） ────────
@@ -268,6 +313,52 @@ function newTexture(gl, bitmap) {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
   return tex;
+}
+
+// ── 上传单通道浮点纹理（深度图）[新] ──────────────────────────────────
+// 对比上面的 newTexture：
+//   newTexture      ：RGBA + UNSIGNED_BYTE，来源是 ImageBitmap，每个通道 8 位（0~255）
+//   newFloatTexture ：R32F + FLOAT，来源是 Float32Array，每个像素 1 个 32 位小数
+// R32F 的"线性过滤"需要扩展 OES_texture_float_linear；
+// 没有这个扩展就用 R16F（半精度，约 2000 档以上，WebGL2 默认支持线性过滤）
+function newFloatTexture(gl, depth) {
+  const linearOK = !!gl.getExtension('OES_texture_float_linear');
+  const internalFormat = linearOK ? gl.R32F : gl.R16F;
+  console.log('深度纹理格式:', linearOK ? 'R32F' : 'R16F');
+
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, depth.width, depth.height, 0,
+                gl.RED, gl.FLOAT, depth.data);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return tex;
+}
+
+// ── 把 Float32Array 深度图画到侧栏的 2D 画布 ─────────────────────────
+// 小数 0~1 → 灰度 0~255。这里只是"给人看"，所以转成 8 位没关系；
+// 送给 shader 的仍然是原始 float，不受影响。
+function showDepthPreview(depth) {
+  const { width, height, data } = depth;
+  const canvas = document.getElementById('depthView');
+  canvas.width = width;
+  canvas.height = height;
+
+  const ctx = canvas.getContext('2d');
+  const img = ctx.createImageData(width, height);
+  for (let y = 0; y < height; y++) {
+    // depth.data 的行顺序已经为了纹理翻转过（第 0 行在底部），画 2D 画布要翻回来
+    const srcRow = height - 1 - y;
+    for (let x = 0; x < width; x++) {
+      const v = Math.round(data[srcRow * width + x] * 255);
+      const i = (y * width + x) * 4;
+      img.data[i] = img.data[i + 1] = img.data[i + 2] = v;
+      img.data[i + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
 }
 
 function bindSlider(id, key, params) {
