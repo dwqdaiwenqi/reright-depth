@@ -51,7 +51,7 @@ type depthResult struct {
 }
 
 func main() {
-	imagePath := flag.String("image", "30-3.png", "输入图片路径")
+	imagePath := flag.String("image", "25-3.png", "输入图片路径")
 	server := flag.String("server", "http://localhost:8888", "深度服务地址")
 	size := flag.String("size", "small", "模型大小：small | base | large")
 	flag.Parse()
@@ -135,6 +135,7 @@ func main() {
 		scale := imgui.CurrentIO().DisplayFramebufferScale().X
 		r.draw(s, int32(float32(imgW)*scale), int32(float32(imgH)*scale))
 
-		s.drawPanel(float32(imgW), float32(imgH)) // ImGui 控件在这之后由后端统一绘制
+		s.drawLightMarker(float32(imgW), float32(imgH)) // 光源位置的小圆点
+		s.drawPanel(float32(imgW), float32(imgH))       // ImGui 控件在这之后由后端统一绘制
 	})
 }

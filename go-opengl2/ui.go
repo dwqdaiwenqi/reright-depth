@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+
 	"github.com/AllenDang/cimgui-go/imgui"
 )
 
@@ -68,8 +70,13 @@ func (s *state) drawPanel(winW, winH float32) {
 	imgui.TextWrapped(s.status)
 	imgui.Separator()
 
+	// ── 光的位置：x、y 由鼠标控制，z（高度）由这个滑块控制 ──
+	imgui.SeparatorText("Light position")
+	imgui.SliderFloat("Z (height)", &s.height, 0.2, 3)
+	imgui.TextUnformatted(fmt.Sprintf("x=%.2f  y=%.2f  z=%.2f", s.lightX, s.lightY, s.height)) // TextUnformatted 不解析 %，安全
+
+	imgui.SeparatorText("Lighting")
 	imgui.SliderFloat("Intensity", &s.intensity, 0, 4)
-	imgui.SliderFloat("Light height", &s.height, 0.2, 3)
 	imgui.SliderFloat("Ambient", &s.ambient, 0, 1)
 	imgui.SliderFloat("Depth scale", &s.depthScale, 0.01, 0.5)
 	imgui.SliderFloat("Specular", &s.specular, 0, 2)
@@ -80,4 +87,29 @@ func (s *state) drawPanel(winW, winH float32) {
 	imgui.TextWrapped("Move the mouse over the image to move the light.")
 
 	imgui.End()
+}
+
+// 在图像上画一个小圆点，标出光的 x、y 位置；旁边写上高度 z。
+// 用 ImGui 的"背景绘制列表"：画在我们的 OpenGL 图像之上、控制面板之下，不会盖住面板
+// 注意：多视口开启时 ImGui 用屏幕坐标，所以要加上主窗口位置 vp.Pos()
+func (s *state) drawLightMarker(imageW, imageH float32) {
+	vp := imgui.MainViewport()
+	center := imgui.NewVec2(
+		vp.Pos().X+s.lightX*imageW,
+		vp.Pos().Y+(1-s.lightY)*imageH, // 光的 y 是"向上为正"，屏幕 y 是"向下为正"，要翻回来
+	)
+
+	// 光越高，圆点越大（给"高度"一个直观的感觉）
+	radius := 4 + 3*s.height
+
+	dl := imgui.BackgroundDrawList()
+	black := imgui.ColorU32Vec4(imgui.NewVec4(0, 0, 0, 0.8))
+	yellow := imgui.ColorU32Vec4(imgui.NewVec4(1, 0.9, 0.2, 1))
+	white := imgui.ColorU32Vec4(imgui.NewVec4(1, 1, 1, 1))
+
+	dl.AddCircleFilled(center, radius+2, black) // 黑色底，深浅背景上都看得清
+	dl.AddCircleFilled(center, radius, yellow)  // 黄色圆点
+	dl.AddCircle(center, radius+4, white)       // 外圈
+	dl.AddTextVec2(imgui.NewVec2(center.X+radius+8, center.Y-8), white,
+		fmt.Sprintf("z=%.2f", s.height))
 }
